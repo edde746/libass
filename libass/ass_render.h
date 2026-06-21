@@ -238,6 +238,7 @@ struct render_context {
     ASS_Shaper *shaper;
     RasterizerData rasterizer;
     CacheClient *cache_client;
+    ImagePool *image_pool;
 
     ASS_Event *event;
     ASS_Style *style;
@@ -346,8 +347,6 @@ struct ass_renderer {
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
-    ImagePool *image_pool;      // recycles ASS_ImagePriv shells across frames
-
     EventImages *eimg;          // temporary buffer for sorting rendered events
     int eimg_size;              // allocated buffer size
     EventImages *eimg_sorted;   // temporary buffer for stable layer sorting

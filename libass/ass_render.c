@@ -75,6 +75,12 @@ static bool text_info_init(TextInfo* text_info)
     return true;
 }
 
+static ImagePool *image_pool_create(void);
+static void image_pool_maybe_destroy(ImagePool *pool);
+static void image_pool_renderer_done(ImagePool *pool);
+static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                     ASS_Event *event);
+
 static void text_info_done(TextInfo* text_info)
 {
     if (text_info->combined_bitmaps)
@@ -101,6 +107,8 @@ static bool render_context_init(RenderContext *state, ASS_Renderer *priv)
     if (!(state->shaper = ass_shaper_new(priv->cache.metrics_cache, priv->cache.face_size_metrics_cache, state->cache_client)))
         return false;
 
+    state->image_pool = image_pool_create();  // NULL => fall back to malloc
+
     return ass_rasterizer_init(&priv->engine, &state->rasterizer, RASTERIZER_PRECISION);
 }
 
@@ -112,13 +120,10 @@ static void render_context_done(RenderContext *state)
         ass_shaper_free(state->shaper);
 
     text_info_done(&state->text_info);
-}
 
-static ImagePool *image_pool_create(void);
-static void image_pool_maybe_destroy(ImagePool *pool);
-static void image_pool_renderer_done(ImagePool *pool);
-static bool event_has_hard_overrides(ASS_Renderer *render_priv,
-                                     ASS_Event *event);
+    image_pool_renderer_done(state->image_pool);
+    state->image_pool = NULL;
+}
 
 ASS_Renderer *ass_renderer_init(ASS_Library *library)
 {
@@ -148,7 +153,6 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
 
     priv->library = library;
     priv->ftlibrary = ft;
-    priv->image_pool = image_pool_create();  // NULL => fall back to malloc
     // images_root and related stuff is zero-filled in calloc
 
     unsigned flags = ASS_CPU_FLAG_ALL;
@@ -267,10 +271,6 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
-
-    // The pool is freed now if no images remain checked out, otherwise once the
-    // caller releases the image list(s) it still holds.
-    image_pool_renderer_done(render_priv->image_pool);
 
     render_context_done(&render_priv->state);
 
@@ -580,7 +580,7 @@ static ASS_Image **render_glyph_i(RenderContext *state,
         if (lbrk > r[j].x0) {
             if (lbrk > r[j].x1) lbrk = r[j].x1;
             if (_a(color) != 0xFF) {
-                img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + r[j].x0,
+                img = my_draw_bitmap(state->image_pool, bm->buffer + r[j].y0 * bm->stride + r[j].x0,
                                      lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
                                      dst_x + r[j].x0, dst_y + r[j].y0, color, source);
                 if (!img) break;
@@ -592,7 +592,7 @@ static ASS_Image **render_glyph_i(RenderContext *state,
         if (lbrk < r[j].x1) {
             if (lbrk < r[j].x0) lbrk = r[j].x0;
             if (_a(color2) != 0xFF) {
-                img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + lbrk,
+                img = my_draw_bitmap(state->image_pool, bm->buffer + r[j].y0 * bm->stride + lbrk,
                                      r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
                                      dst_x + lbrk, dst_y + r[j].y0, color2, source);
                 if (!img) break;
@@ -671,7 +671,7 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
         if (brk > b_x1)
             brk = b_x1;
         if (_a(color) != 0xFF) {
-            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + b_x0,
+            img = my_draw_bitmap(state->image_pool, bm->buffer + bm->stride * b_y0 + b_x0,
                                  brk - b_x0, b_y1 - b_y0, bm->stride,
                                  dst_x + b_x0, dst_y + b_y0, color, source);
             if (!img) return tail;
@@ -684,7 +684,7 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
         if (brk < b_x0)
             brk = b_x0;
         if (_a(color2) != 0xFF) {
-            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + brk,
+            img = my_draw_bitmap(state->image_pool, bm->buffer + bm->stride * b_y0 + brk,
                                  b_x1 - brk, b_y1 - b_y0, bm->stride,
                                  dst_x + brk, dst_y + b_y0, color2, source);
             if (!img) return tail;
@@ -3073,7 +3073,7 @@ static void add_background(RenderContext *state, EventImages *event_images)
     if (!nbuffer)
         return;
     memset(nbuffer, 0xFF, w * h);
-    ASS_Image *img = my_draw_bitmap(render_priv->image_pool, nbuffer, w, h, w, left, top,
+    ASS_Image *img = my_draw_bitmap(state->image_pool, nbuffer, w, h, w, left, top,
                                     clr, NULL);
     if (img) {
         img->next = event_images->imgs;
