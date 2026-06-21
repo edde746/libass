@@ -2533,6 +2533,10 @@ static void render_and_combine_glyphs(RenderContext *state,
     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
     CombinedBitmapInfo *current_info = NULL;
     ASS_DVector offset;
+    // Loop-invariant blur scale (depends only on the event render context).
+    const double blur_radius_scale = 2 / sqrt(log(256));
+    const double blur_scale_x = state->blur_scale_x * blur_radius_scale;
+    const double blur_scale_y = state->blur_scale_y * blur_radius_scale;
     for (int i = 0; i < text_info->length; i++) {
         GlyphInfo *info = text_info->glyphs + i;
         if (info->starts_new_run) new_run = true;
@@ -2587,9 +2591,6 @@ static void render_and_combine_glyphs(RenderContext *state,
                 filter->be = info->be;
 
                 int32_t shadow_mask_x, shadow_mask_y;
-                double blur_radius_scale = 2 / sqrt(log(256));
-                double blur_scale_x = state->blur_scale_x * blur_radius_scale;
-                double blur_scale_y = state->blur_scale_y * blur_radius_scale;
                 filter->blur_x = quantize_blur(info->blur * blur_scale_x, &shadow_mask_x);
                 filter->blur_y = quantize_blur(info->blur * blur_scale_y, &shadow_mask_y);
                 if (flags & FILTER_NONZERO_SHADOW) {
