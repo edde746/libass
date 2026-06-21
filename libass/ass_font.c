@@ -287,6 +287,52 @@ uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol)
     return symbol;
 }
 
+/**
+ * \brief Resolve a Unicode codepoint to a FreeType glyph index for a given
+ * face, caching the result per face to avoid repeated charmap lookups.
+ *
+ * Returns exactly FT_Get_Char_Index(face, ass_font_index_magic(face, symbol)),
+ * preserving the "skip FT_Get_Char_Index when the magic-mapped value is 0"
+ * behaviour used throughout libass, so output is bit-identical.
+ *
+ * The cache is keyed only by (face, symbol). This is valid because a face's
+ * active charmap is fixed after ass_charmap_magic() runs in add_face(); the
+ * sole later mutation (the broken-font fallback in ass_font_get_index) clears
+ * the affected face's cache.
+ */
+uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol)
+{
+    FT_Face face = font->faces[face_index];
+
+    GlyphIndexCacheEntry *cache = font->index_cache[face_index];
+    if (!cache) {
+        cache = calloc(ASS_GLYPH_INDEX_CACHE_SIZE, sizeof(*cache));
+        font->index_cache[face_index] = cache;
+        // On allocation failure just fall through to the uncached path.
+    }
+
+    unsigned slot = 0;
+    if (cache) {
+        // Mix the codepoint to spread the small ASCII/BMP range across slots.
+        slot = (symbol * 2654435761u) & (ASS_GLYPH_INDEX_CACHE_SIZE - 1);
+        GlyphIndexCacheEntry *e = &cache[slot];
+        if (e->index && e->symbol == symbol)
+            return e->index - 1;
+    }
+
+    uint32_t index = ass_font_index_magic(face, symbol);
+    if (index)
+        index = FT_Get_Char_Index(face, index);
+
+    if (cache) {
+        GlyphIndexCacheEntry *e = &cache[slot];
+        e->symbol = symbol;
+        e->index = index + 1;  // store +1 so 0 marks an empty slot
+    }
+
+    return index;
+}
+
 static void set_font_metrics(FT_Face face)
 {
     // Mimicking GDI's behavior for asc/desc/height.
@@ -505,6 +551,8 @@ size_t ass_font_construct(void *key, void *value, void *priv)
     font->library = render_priv->library;
     font->ftlibrary = render_priv->ftlibrary;
     font->n_faces = 0;
+    for (int i = 0; i < ASS_FONT_MAX_FACES; i++)
+        font->index_cache[i] = NULL;
     font->desc.family = desc->family;
     font->desc.bold = desc->bold;
     font->desc.italic = desc->italic;
@@ -659,9 +707,7 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
 
     for (i = 0; i < font->n_faces && index == 0; ++i) {
         face = font->faces[i];
-        index = ass_font_index_magic(face, symbol);
-        if (index)
-            index = FT_Get_Char_Index(face, index);
+        index = ass_font_get_char_index(font, i, symbol);
         if (index)
             *face_index = i;
     }
@@ -682,6 +728,11 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                 int i;
                 ass_msg(font->library, MSGL_WARN,
                     "Glyph 0x%X not found, broken font? Trying all charmaps", symbol);
+                // The charmap is about to change for this face, so any cached
+                // symbol -> index results computed under the old charmap are
+                // now invalid: drop them.
+                free(font->index_cache[face_idx]);
+                font->index_cache[face_idx] = NULL;
                 for (i = 0; i < face->num_charmaps; i++) {
                     FT_Set_Charmap(face, face->charmaps[i]);
                     index = ass_font_index_magic(face, symbol);
@@ -757,6 +808,7 @@ void ass_font_clear(ASS_Font *font)
             FT_Done_Face(font->faces[i]);
         if (font->hb_fonts[i])
             hb_font_destroy(font->hb_fonts[i]);
+        free(font->index_cache[i]);
     }
     free((char *) font->desc.family.str);
 }

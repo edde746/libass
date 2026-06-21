@@ -39,6 +39,16 @@ typedef struct ass_font ASS_Font;
 #define DECO_STRIKETHROUGH 2
 #define DECO_ROTATE        4
 
+// Per-face direct-mapped cache for symbol -> FreeType glyph index lookups.
+// Avoids re-querying FreeType's charmap (tt_cmap4_char_map_binary etc.) for
+// the same codepoint on every frame. Must be a power of two.
+#define ASS_GLYPH_INDEX_CACHE_SIZE 512
+
+typedef struct {
+    uint32_t symbol;  // Unicode codepoint that was looked up
+    uint32_t index;   // FT_Get_Char_Index() result + 1; 0 means empty slot
+} GlyphIndexCacheEntry;
+
 struct ass_font {
     ASS_FontDesc desc;
     ASS_Library *library;
@@ -46,6 +56,7 @@ struct ass_font {
     int faces_uid[ASS_FONT_MAX_FACES];
     FT_Face faces[ASS_FONT_MAX_FACES];
     struct hb_font_t *hb_fonts[ASS_FONT_MAX_FACES];
+    GlyphIndexCacheEntry *index_cache[ASS_FONT_MAX_FACES];
     int n_faces;
 };
 
@@ -60,6 +71,7 @@ void ass_font_get_asc_desc(ASS_Font *font, int face_index,
 int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                        uint32_t symbol, int *face_index, int *glyph_index);
 uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol);
+uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol);
 bool ass_font_get_glyph(ASS_Font *font, int face_index, int index,
                         ASS_Hinting hinting);
 void ass_font_clear(ASS_Font *font);
