@@ -286,6 +286,22 @@ typedef enum {
      */
     ASS_FEATURE_WRAP_UNICODE,
 
+    /**
+     * Use faster, approximate Gaussian blur kernels.
+     *
+     * The default blur always uses a kernel of at least radius 4 (a 9-tap
+     * filter), which is far wider than necessary for the small blur radii that
+     * dominate typical subtitles and signs. When this feature is enabled, the
+     * blur picks a kernel sized to the actual standard deviation, refitting the
+     * filter coefficients to the smaller radius. This is noticeably faster for
+     * blur-heavy content (e.g. per-frame re-blurred motion-tracked signs) at
+     * the cost of a small, sub-perceptual change to the blurred output
+     * (bounded well within the renderer's own blur precision budget).
+     *
+     * This is incompatible with VSFilter and disabled by default.
+     */
+    ASS_FEATURE_FAST_BLUR,
+
     // New enum values can be added here in new ABI-compatible library releases.
 } ASS_Feature;
 
