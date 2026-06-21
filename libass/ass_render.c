@@ -3480,9 +3480,22 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         }
     }
 
-    // sort by layer
-    if (cnt > 0)
-        qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
+    // sort by layer; cmp_event_layer is a total order (ReadOrder is unique),
+    // so the active set is very often already in sorted order (events are
+    // scanned in array order). Skip the qsort in that common case — same result.
+    if (cnt > 0) {
+        bool sorted = true;
+        for (int i = 1; i < cnt; i++) {
+            ASS_Event *a = priv->eimg[i - 1].event, *b = priv->eimg[i].event;
+            if (a->Layer > b->Layer ||
+                (a->Layer == b->Layer && a->ReadOrder >= b->ReadOrder)) {
+                sorted = false;
+                break;
+            }
+        }
+        if (!sorted)
+            qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
+    }
 
     // call fix_collisions for each group of events with the same layer
     EventImages *last = priv->eimg;
