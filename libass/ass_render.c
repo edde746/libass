@@ -2490,6 +2490,9 @@ static void render_and_combine_glyphs(RenderContext *state,
 
         for (; info; info = info->next) {
             int flags = 0;
+            if (render_priv->track->parser_priv->feature_flags &
+                FEATURE_MASK(ASS_FEATURE_FAST_BLUR))
+                flags |= FILTER_FAST_BLUR;
             if (info->border_style == 3)
                 flags |= FILTER_BORDER_STYLE_3;
             if (info->border_x || info->border_y)
@@ -2746,11 +2749,12 @@ size_t ass_composite_construct(void *key, void *value, void *priv)
     }
 
     int flags = k->filter.flags;
+    bool fast_blur = flags & FILTER_FAST_BLUR;
     double r2x = restore_blur(k->filter.blur_x);
     double r2y = restore_blur(k->filter.blur_y);
     if (!(flags & FILTER_NONZERO_BORDER) || (flags & FILTER_BORDER_STYLE_3))
-        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, r2x, r2y);
-    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, r2x, r2y);
+        ass_synth_blur(&render_priv->engine, &v->bm, k->filter.be, fast_blur, r2x, r2y);
+    ass_synth_blur(&render_priv->engine, &v->bm_o, k->filter.be, fast_blur, r2x, r2y);
 
     if (!(flags & FILTER_FILL_IN_BORDER) && !(flags & FILTER_FILL_IN_SHADOW))
         ass_fix_outline(&v->bm, &v->bm_o);

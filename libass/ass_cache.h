@@ -76,6 +76,7 @@ enum {
     FILTER_NONZERO_SHADOW = 0x04,
     FILTER_FILL_IN_SHADOW = 0x08,
     FILTER_FILL_IN_BORDER = 0x10,
+    FILTER_FAST_BLUR      = 0x20,
 };
 
 // ass_cache_get() takes ownership of the bitmaps array and either frees it
