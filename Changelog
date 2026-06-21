@@ -1,3 +1,11 @@
+libass (0.18.0)
+ * Add thread-safe cache and font access internals, plus support for per-event
+   threaded rendering
+ * Add parser, cache, rasterizer, and renderer performance improvements
+ * Add ASS_FEATURE_FAST_BLUR for faster approximate blur rendering
+ * Support legacy Arabic charmap handling
+ * Improve Meson, CI, and cross-platform build coverage
+
 libass (0.17.4)
  * add new API to prune old events from memory
    * ass_prune_events for manual pruning
