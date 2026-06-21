@@ -48,6 +48,7 @@
 #define MAX_PERSP_SCALE 16.0
 #define SUBPIXEL_ORDER 3  // ~ log2(64 / POSITION_PRECISION)
 #define BLUR_PRECISION (1.0 / 256)  // blur error as fraction of full input range
+#define MOTION_CACHE_SUBPIXEL_STEP 2  // snap 1/8-pixel phases to a 1/4-pixel grid
 
 
 static bool text_info_init(TextInfo* text_info)
@@ -713,6 +714,40 @@ static bool quantize_transform(double m[3][3], ASS_Vector *pos,
     key->matrix_y.x = qm[1][0];  key->matrix_y.y = qm[1][1];
     key->matrix_z.x = qm[2][0];  key->matrix_z.y = qm[2][1];
     return true;
+}
+
+static int32_t round_to_step(int32_t value, int32_t step)
+{
+    if (step <= 1)
+        return value;
+
+    int64_t v = value;
+    if (v >= 0)
+        return (int32_t) (((v + step / 2) / step) * step);
+    return (int32_t) (-(((-v + step / 2) / step) * step));
+}
+
+static void snap_subpixel_offset(int32_t *offset, int *pos)
+{
+    int32_t snapped = round_to_step(*offset, MOTION_CACHE_SUBPIXEL_STEP);
+    if (snapped >= (1 << SUBPIXEL_ORDER)) {
+        snapped -= 1 << SUBPIXEL_ORDER;
+        (*pos)++;
+    }
+    *offset = snapped;
+}
+
+static void snap_motion_cache_key(BitmapHashKey *key, ASS_Vector *pos)
+{
+    snap_subpixel_offset(&key->offset.x, &pos->x);
+    snap_subpixel_offset(&key->offset.y, &pos->y);
+}
+
+static bool motion_cache_enabled(RenderContext *state, GlyphInfo *info)
+{
+    return (state->renderer->track->parser_priv->feature_flags &
+            FEATURE_MASK(ASS_FEATURE_MOTION_CACHE)) &&
+           (info->blur > 0 || info->be);
 }
 
 static void restore_transform(double m[3][3], const BitmapHashKey *key)
@@ -1475,6 +1510,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     key.outline = info->outline;
     if (!quantize_transform(m, pos, offset, first, &key))
         return;
+    if (motion_cache_enabled(state, info))
+        snap_motion_cache_key(&key, pos);
 
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm || !info->bm->buffer)
@@ -1599,6 +1636,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     if (!key.outline || !key.outline->valid ||
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
+    if (motion_cache_enabled(state, info))
+        snap_motion_cache_key(&key, pos_o);
 
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, &key, state);
     if (!info->bm_o || !info->bm_o->buffer) {

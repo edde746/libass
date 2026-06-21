@@ -302,6 +302,23 @@ typedef enum {
      */
     ASS_FEATURE_FAST_BLUR,
 
+    /**
+     * Reuse blurred bitmap/composite cache entries across tiny subpixel
+     * motion deltas.
+     *
+     * Motion-tracked signs are often authored as many frame-sized events whose
+     * vector geometry, blur and colors are effectively stable, but whose
+     * position/origin values jitter by subpixel amounts. Normally libass keeps
+     * a separate transformed bitmap for each subpixel phase. When this feature
+     * is enabled, blurred glyph and drawing bitmap keys are snapped from the
+     * usual 1/8-pixel phase grid to a 1/4-pixel phase grid, allowing
+     * visually-near-identical frames to reuse more transformed and blurred
+     * work.
+     *
+     * This is incompatible with VSFilter and disabled by default.
+     */
+    ASS_FEATURE_MOTION_CACHE,
+
     // New enum values can be added here in new ABI-compatible library releases.
 } ASS_Feature;
 

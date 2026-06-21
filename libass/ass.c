@@ -1824,6 +1824,11 @@ int ass_track_set_feature(ASS_Track *track, ASS_Feature feature, int enable)
         // bundled with the incompatible-extensions umbrella above.
         requested = FEATURE_MASK(ASS_FEATURE_FAST_BLUR);
         break;
+    case ASS_FEATURE_MOTION_CACHE:
+        // A performance/quality knob, opted into on its own rather than
+        // bundled with the incompatible-extensions umbrella above.
+        requested = FEATURE_MASK(ASS_FEATURE_MOTION_CACHE);
+        break;
     default:
         if (!(FEATURE_MASK(feature) & supported))
             return -1;
