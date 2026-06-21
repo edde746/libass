@@ -125,6 +125,7 @@ typedef struct {
 
     size_t bitmap_count, max_bitmap_count;
     BitmapRef *bitmaps;
+    bool reuse_bitmaps;
 
     int x, y;
     Bitmap *bm, *bm_o, *bm_s;   // glyphs, outline, shadow bitmaps
@@ -337,6 +338,8 @@ struct ass_renderer {
 
     EventImages *eimg;          // temporary buffer for sorting rendered events
     int eimg_size;              // allocated buffer size
+    EventImages *eimg_sorted;   // temporary buffer for stable layer sorting
+    int eimg_sorted_size;       // allocated buffer size
 
     // frame-global data
     int width, height;          // screen dimensions (the whole frame from ass_set_frame_size)

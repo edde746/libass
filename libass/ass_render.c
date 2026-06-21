@@ -20,6 +20,7 @@
 #include "ass_compat.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <stdbool.h>
@@ -39,6 +40,7 @@
 #define MAX_LINES_INITIAL 64
 #define MAX_BITMAPS_INITIAL 16
 #define MAX_SUB_BITMAPS_INITIAL 64
+#define MAX_LAYER_SORT_RANGE 64
 #define SUBPIXEL_MASK 63
 #define STROKER_PRECISION 16     // stroker error in integer units, unrelated to final accuracy
 #define RASTERIZER_PRECISION 16  // rasterizer spline approximation error in 1/64 pixel units
@@ -69,6 +71,9 @@ static bool text_info_init(TextInfo* text_info)
 
 static void text_info_done(TextInfo* text_info)
 {
+    if (text_info->combined_bitmaps)
+        for (int i = 0; i < text_info->max_bitmaps; i++)
+            free(text_info->combined_bitmaps[i].bitmaps);
     free(text_info->glyphs);
     free(text_info->event_text);
     free(text_info->breaks);
@@ -203,6 +208,7 @@ void ass_renderer_done(ASS_Renderer *render_priv)
     if (render_priv->ftlibrary)
         FT_Done_FreeType(render_priv->ftlibrary);
     free(render_priv->eimg);
+    free(render_priv->eimg_sorted);
 
     render_context_done(&render_priv->state);
 
@@ -437,23 +443,27 @@ static ASS_Image **render_glyph_i(RenderContext *state,
         // split up into left and right for karaoke, if needed
         if (lbrk > r[j].x0) {
             if (lbrk > r[j].x1) lbrk = r[j].x1;
-            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + r[j].x0,
-                                 lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + r[j].x0, dst_y + r[j].y0, color, source);
-            if (!img) break;
-            img->type = type;
-            *tail = img;
-            tail = &img->next;
+            if (_a(color) != 0xFF) {
+                img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + r[j].x0,
+                                     lbrk - r[j].x0, r[j].y1 - r[j].y0, bm->stride,
+                                     dst_x + r[j].x0, dst_y + r[j].y0, color, source);
+                if (!img) break;
+                img->type = type;
+                *tail = img;
+                tail = &img->next;
+            }
         }
         if (lbrk < r[j].x1) {
             if (lbrk < r[j].x0) lbrk = r[j].x0;
-            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + lbrk,
-                                 r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
-                                 dst_x + lbrk, dst_y + r[j].y0, color2, source);
-            if (!img) break;
-            img->type = type;
-            *tail = img;
-            tail = &img->next;
+            if (_a(color2) != 0xFF) {
+                img = my_draw_bitmap(render_priv->image_pool, bm->buffer + r[j].y0 * bm->stride + lbrk,
+                                     r[j].x1 - lbrk, r[j].y1 - r[j].y0, bm->stride,
+                                     dst_x + lbrk, dst_y + r[j].y0, color2, source);
+                if (!img) break;
+                img->type = type;
+                *tail = img;
+                tail = &img->next;
+            }
         }
     }
 
@@ -524,24 +534,28 @@ render_glyph(RenderContext *state, Bitmap *bm, int dst_x, int dst_y,
     if (brk > b_x0) {           // draw left part
         if (brk > b_x1)
             brk = b_x1;
-        img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + b_x0,
-                             brk - b_x0, b_y1 - b_y0, bm->stride,
-                             dst_x + b_x0, dst_y + b_y0, color, source);
-        if (!img) return tail;
-        img->type = type;
-        *tail = img;
-        tail = &img->next;
+        if (_a(color) != 0xFF) {
+            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + b_x0,
+                                 brk - b_x0, b_y1 - b_y0, bm->stride,
+                                 dst_x + b_x0, dst_y + b_y0, color, source);
+            if (!img) return tail;
+            img->type = type;
+            *tail = img;
+            tail = &img->next;
+        }
     }
     if (brk < b_x1) {           // draw right part
         if (brk < b_x0)
             brk = b_x0;
-        img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + brk,
-                             b_x1 - brk, b_y1 - b_y0, bm->stride,
-                             dst_x + brk, dst_y + b_y0, color2, source);
-        if (!img) return tail;
-        img->type = type;
-        *tail = img;
-        tail = &img->next;
+        if (_a(color2) != 0xFF) {
+            img = my_draw_bitmap(render_priv->image_pool, bm->buffer + bm->stride * b_y0 + brk,
+                                 b_x1 - brk, b_y1 - b_y0, bm->stride,
+                                 dst_x + brk, dst_y + b_y0, color2, source);
+            if (!img) return tail;
+            img->type = type;
+            *tail = img;
+            tail = &img->next;
+        }
     }
     return tail;
 }
@@ -2569,12 +2583,15 @@ static void render_and_combine_glyphs(RenderContext *state,
 
             if (new_run) {
                 if (nb_bitmaps >= text_info->max_bitmaps) {
-                    size_t new_size = 2 * text_info->max_bitmaps;
+                    size_t old_size = text_info->max_bitmaps;
+                    size_t new_size = 2 * old_size;
                     if (!ASS_REALLOC_ARRAY(text_info->combined_bitmaps, new_size))
                         continue;
 
                     text_info->max_bitmaps = new_size;
                     combined_info = text_info->combined_bitmaps;
+                    memset(combined_info + old_size, 0,
+                           (new_size - old_size) * sizeof(*combined_info));
                 }
                 current_info = &combined_info[nb_bitmaps];
 
@@ -2605,12 +2622,14 @@ static void render_and_combine_glyphs(RenderContext *state,
                 current_info->bm = current_info->bm_o = current_info->bm_s = NULL;
                 current_info->image = NULL;
 
-                current_info->bitmap_count = current_info->max_bitmap_count = 0;
-                current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
-                if (!current_info->bitmaps)
-                    continue;
+                current_info->bitmap_count = 0;
+                if (!current_info->bitmaps) {
+                    current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
+                    if (!current_info->bitmaps)
+                        continue;
 
-                current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                    current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
+                }
 
                 nb_bitmaps++;
                 new_run = false;
@@ -2646,10 +2665,8 @@ static void render_and_combine_glyphs(RenderContext *state,
 
     for (int i = 0; i < nb_bitmaps; i++) {
         CombinedBitmapInfo *info = &combined_info[i];
-        if (!info->bitmap_count) {
-            free(info->bitmaps);
+        if (!info->bitmap_count)
             continue;
-        }
 
         if (info->effect_type == EF_KARAOKE_KF)
             info->effect_timing = lround(d6_to_double(info->leftmost_x) +
@@ -2666,7 +2683,17 @@ static void render_and_combine_glyphs(RenderContext *state,
         key.filter = info->filter;
         key.bitmap_count = info->bitmap_count;
         key.bitmaps = info->bitmaps;
+        bool owned_bitmaps = !info->reuse_bitmaps;
+        key.owns_bitmaps = owned_bitmaps;
         CompositeHashValue *val = ass_cache_get(render_priv->cache.composite_cache, &key, render_priv);
+        if (owned_bitmaps)
+            info->reuse_bitmaps = val != NULL;
+        else if (!key.bitmaps)
+            info->reuse_bitmaps = false;
+        if (!key.bitmaps) {
+            info->bitmaps = NULL;
+            info->max_bitmap_count = 0;
+        }
         if (!val)
             continue;
 
@@ -2853,12 +2880,14 @@ static void add_background(RenderContext *state, EventImages *event_images)
     int h = bottom - top;
     if (w < 1 || h < 1)
         return;
+    uint32_t clr = state->c[3];
+    ass_apply_fade(&clr, state->fade);
+    if (_a(clr) == 0xFF)
+        return;
     void *nbuffer = ass_aligned_alloc(1, w * h, false);
     if (!nbuffer)
         return;
     memset(nbuffer, 0xFF, w * h);
-    uint32_t clr = state->c[3];
-    ass_apply_fade(&clr, state->fade);
     ASS_Image *img = my_draw_bitmap(render_priv->image_pool, nbuffer, w, h, w, left, top,
                                     clr, NULL);
     if (img) {
@@ -3190,6 +3219,44 @@ static int cmp_event_layer(const void *p1, const void *p2)
     return 0;
 }
 
+static bool stable_sort_events_by_layer(ASS_Renderer *render_priv,
+                                        EventImages *events, int cnt,
+                                        int min_layer, int max_layer)
+{
+    long long layer_range_ll = (long long) max_layer - min_layer + 1;
+    if (layer_range_ll <= 0 || layer_range_ll > MAX_LAYER_SORT_RANGE)
+        return false;
+
+    if (cnt > render_priv->eimg_sorted_size) {
+        EventImages *sorted =
+            ass_realloc_array(render_priv->eimg_sorted, cnt, sizeof(*sorted));
+        if (!sorted)
+            return false;
+        render_priv->eimg_sorted = sorted;
+        render_priv->eimg_sorted_size = cnt;
+    }
+
+    int layer_range = (int) layer_range_ll;
+    int counts[MAX_LAYER_SORT_RANGE] = { 0 };
+    int offsets[MAX_LAYER_SORT_RANGE];
+    for (int i = 0; i < cnt; i++)
+        counts[(int) ((long long) events[i].event->Layer - min_layer)]++;
+
+    int pos = 0;
+    for (int i = 0; i < layer_range; i++) {
+        offsets[i] = pos;
+        pos += counts[i];
+    }
+
+    for (int i = 0; i < cnt; i++) {
+        int layer = (int) ((long long) events[i].event->Layer - min_layer);
+        render_priv->eimg_sorted[offsets[layer]++] = events[i];
+    }
+
+    memcpy(events, render_priv->eimg_sorted, cnt * sizeof(*events));
+    return true;
+}
+
 static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
                                        ASS_Event *event)
 {
@@ -3466,6 +3533,10 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
 
     // render events separately
     int cnt = 0;
+    bool readorder_sorted = true;
+    int last_read_order = INT_MIN;
+    int min_layer = INT_MAX;
+    int max_layer = INT_MIN;
     for (int i = 0; i < track->n_events; i++) {
         ASS_Event *event = track->events + i;
         if ((event->Start <= now)
@@ -3476,8 +3547,16 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                     realloc(priv->eimg,
                             priv->eimg_size * sizeof(EventImages));
             }
-            if (ass_render_event(&priv->state, event, priv->eimg + cnt))
+            if (ass_render_event(&priv->state, event, priv->eimg + cnt)) {
+                if (cnt > 0 && event->ReadOrder <= last_read_order)
+                    readorder_sorted = false;
+                last_read_order = event->ReadOrder;
+                if (event->Layer < min_layer)
+                    min_layer = event->Layer;
+                if (event->Layer > max_layer)
+                    max_layer = event->Layer;
                 cnt++;
+            }
         }
     }
 
@@ -3494,7 +3573,10 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
                 break;
             }
         }
-        if (!sorted)
+        if (!sorted &&
+                (!readorder_sorted ||
+                 !stable_sort_events_by_layer(priv, priv->eimg, cnt,
+                                              min_layer, max_layer)))
             qsort(priv->eimg, cnt, sizeof(EventImages), cmp_event_layer);
     }
 
