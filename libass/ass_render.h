@@ -49,12 +49,26 @@
 #define PARSED_FADE (1<<0)
 #define PARSED_A    (1<<1)
 
+typedef struct image_pool ImagePool;
+
 typedef struct {
     ASS_Image result;
     CompositeHashValue *source;
     unsigned char *buffer;
     size_t ref_count;
+    ImagePool *pool;            // owning recycler, or NULL if heap-allocated
 } ASS_ImagePriv;
+
+// Per-renderer free list that recycles ASS_ImagePriv shells across frames.
+// Animated/sign-heavy subtitles emit hundreds-to-thousands of images per frame,
+// each previously a separate malloc()/free(); recycling avoids that churn. The
+// pool outlives the renderer if the caller still holds an image list: it is
+// freed only once the renderer is gone AND no checked-out images remain.
+struct image_pool {
+    ASS_ImagePriv *free_list;   // recycled shells, linked via result.next
+    size_t live;                // images currently checked out (not recycled)
+    bool renderer_alive;
+};
 
 typedef struct {
     int frame_width;
@@ -319,6 +333,7 @@ struct ass_renderer {
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
+    ImagePool *image_pool;      // recycles ASS_ImagePriv shells across frames
 
     EventImages *eimg;          // temporary buffer for sorting rendered events
     int eimg_size;              // allocated buffer size
