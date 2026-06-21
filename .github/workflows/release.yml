@@ -40,7 +40,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            meson ninja-build pkg-config nasm zip xz-utils
+            ninja-build pkg-config nasm python3-pip zip xz-utils
+          python3 -m pip install --user --break-system-packages 'meson>=1.6.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Locate Android NDK
         run: |
