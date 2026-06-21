@@ -60,13 +60,13 @@ ensure_wraps() {
     meson wrap update-db
 
     local wrap
-    for wrap in expat fontconfig freetype2 fribidi harfbuzz libunibreak; do
+    for wrap in freetype2 fribidi harfbuzz libunibreak; do
         if [ ! -f "subprojects/$wrap.wrap" ]; then
             meson wrap install "$wrap"
         fi
     done
 
-    meson subprojects download expat fontconfig freetype2 fribidi harfbuzz libunibreak
+    meson subprojects download freetype2 fribidi harfbuzz libunibreak
 }
 
 android_abi_settings() {
@@ -116,7 +116,6 @@ ar = '$TOOLCHAIN/bin/llvm-ar'
 ranlib = '$TOOLCHAIN/bin/llvm-ranlib'
 strip = '$TOOLCHAIN/bin/llvm-strip'
 nasm = 'nasm'
-gperf = 'gperf'
 pkgconfig = 'false'
 
 [host_machine]
@@ -148,22 +147,11 @@ common_meson_options() {
         -Dprofile=disabled \
         -Dfuzz=disabled \
         -Dcheckasm=disabled \
-        -Dfontconfig=enabled \
+        -Dfontconfig=disabled \
         -Ddirectwrite=disabled \
         -Dcoretext=disabled \
         -Dlibunibreak=enabled \
-        -Drequire-system-font-provider=true \
-        -Dexpat:build_tests=false \
-        -Dfontconfig:cache-build=disabled \
-        -Dfontconfig:doc=disabled \
-        -Dfontconfig:doc-html=disabled \
-        -Dfontconfig:doc-man=disabled \
-        -Dfontconfig:doc-pdf=disabled \
-        -Dfontconfig:doc-txt=disabled \
-        -Dfontconfig:nls=disabled \
-        -Dfontconfig:tests=disabled \
-        -Dfontconfig:tools=disabled \
-        -Dfontconfig:xml-backend=expat \
+        -Drequire-system-font-provider=false \
         -Dharfbuzz:chafa=disabled \
         -Dharfbuzz:docs=disabled \
         -Dharfbuzz:icu=disabled \
@@ -234,7 +222,7 @@ copy_licenses() {
     mkdir -p "$dest/libass"
     cp "$ROOT/COPYING" "$dest/libass/"
 
-    for name in expat fontconfig freetype fribidi harfbuzz libunibreak; do
+    for name in freetype fribidi harfbuzz libunibreak; do
         subdir="$(find "$ROOT/subprojects" -mindepth 1 -maxdepth 1 -type d -name "$name*" | sort | head -n 1)"
         [ -n "$subdir" ] || continue
         mkdir -p "$dest/$name"
@@ -261,9 +249,9 @@ $(
 )
 
 Each \`libass.a\` is a combined static archive built from libass plus the
-WrapDB FreeType, FriBidi, and HarfBuzz fallback dependencies used by the CI
-build. Public libass headers are in \`include/ass\`, and per-ABI pkg-config
-files are in \`lib/<abi>/pkgconfig\`.
+WrapDB FreeType, FriBidi, HarfBuzz, and libunibreak fallback dependencies used
+by the CI build. Public libass headers are in \`include/ass\`, and per-ABI
+pkg-config files are in \`lib/<abi>/pkgconfig\`.
 EOF
 }
 
