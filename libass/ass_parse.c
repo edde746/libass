@@ -201,6 +201,13 @@ static int32_t calc_anim_int32(uint32_t new, uint32_t old, double pwr)
  */
 static void change_color(uint32_t *var, uint32_t new, double pwr)
 {
+    if (pwr == 1.) {
+        *var = (*var & 0xFF) | (new & 0xFFFFFF00);
+        return;
+    } else if (pwr == 0.) {
+        return;
+    }
+
     uint32_t co = ass_bswap32(*var);
     uint32_t cn = ass_bswap32(new);
 
@@ -214,6 +221,13 @@ static void change_color(uint32_t *var, uint32_t new, double pwr)
 // like change_color, but for alpha component only
 static inline void change_alpha(uint32_t *var, int32_t new, double pwr)
 {
+    if (pwr == 1.) {
+        *var = (*var & 0xFFFFFF00) | (uint8_t) new;
+        return;
+    } else if (pwr == 0.) {
+        return;
+    }
+
     *var = (*var & 0xFFFFFF00) | (uint8_t)calc_anim_int32(new, _a(*var), pwr);
 }
 
