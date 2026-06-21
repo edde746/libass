@@ -362,6 +362,8 @@ struct ass_renderer {
 typedef struct render_priv {
     int top, height, left, width;
     int render_id;
+    char *hard_overrides_text;
+    bool has_hard_overrides;
 } RenderPriv;
 
 typedef struct {

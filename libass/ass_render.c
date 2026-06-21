@@ -106,6 +106,8 @@ static void render_context_done(RenderContext *state)
 
 static ImagePool *image_pool_create(void);
 static void image_pool_maybe_destroy(ImagePool *pool);
+static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                     ASS_Event *event);
 
 ASS_Renderer *ass_renderer_init(ASS_Library *library)
 {
@@ -1210,7 +1212,7 @@ init_render_context(RenderContext *state, ASS_Event *event)
 
     ass_apply_transition_effects(state);
     state->explicit = state->evt_type != EVENT_NORMAL ||
-                      ass_event_has_hard_overrides(event->Text);
+                      event_has_hard_overrides(render_priv, event);
 
     ass_reset_render_context(state, NULL);
     state->alignment = state->style->Alignment;
@@ -3271,6 +3273,20 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
     }
 
     return event->render_priv;
+}
+
+static bool event_has_hard_overrides(ASS_Renderer *render_priv,
+                                     ASS_Event *event)
+{
+    ASS_RenderPriv *priv = get_render_priv(render_priv, event);
+    if (!priv)
+        return ass_event_has_hard_overrides(event->Text);
+
+    if (priv->hard_overrides_text != event->Text) {
+        priv->has_hard_overrides = ass_event_has_hard_overrides(event->Text);
+        priv->hard_overrides_text = event->Text;
+    }
+    return priv->has_hard_overrides;
 }
 
 static int overlap(Rect *s1, Rect *s2)
