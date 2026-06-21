@@ -124,9 +124,10 @@ static bool composite_compare(void *a, void *b)
 {
     CompositeHashKey *ak = a;
     CompositeHashKey *bk = b;
-    if (!filter_compare(&ak->filter, &bk->filter))
-        return false;
+    // Cheaper, equally discriminating single-word check first.
     if (ak->bitmap_count != bk->bitmap_count)
+        return false;
+    if (!filter_compare(&ak->filter, &bk->filter))
         return false;
     for (size_t i = 0; i < ak->bitmap_count; i++)
         if (!bitmap_ref_compare(&ak->bitmaps[i], &bk->bitmaps[i]))
