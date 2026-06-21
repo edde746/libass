@@ -40,6 +40,33 @@ struct arg {
 static inline int32_t argtoi32(struct arg arg)
 {
     int32_t value;
+    char *p = arg.start;
+    while (p < arg.end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r'))
+        p++;
+
+    bool neg = false;
+    if (p < arg.end && (*p == '+' || *p == '-'))
+        neg = *p++ == '-';
+
+    if (p < arg.end && *p >= '0' && *p <= '9') {
+        uint64_t limit = neg ? (uint64_t) INT32_MAX + 1 : INT32_MAX;
+        uint64_t acc = 0;
+        bool overflow = false;
+        do {
+            uint64_t digit = *p++ - '0';
+            if (overflow || acc > (limit - digit) / 10) {
+                overflow = true;
+            } else {
+                acc = 10 * acc + digit;
+            }
+        } while (p < arg.end && *p >= '0' && *p <= '9');
+
+        if (overflow)
+            return neg ? INT32_MIN : INT32_MAX;
+        return neg ? (int32_t) -(int64_t) acc : (int32_t) acc;
+    }
+
     mystrtoi32(&arg.start, 10, &value);
     return value;
 }
