@@ -116,6 +116,7 @@ ar = '$TOOLCHAIN/bin/llvm-ar'
 ranlib = '$TOOLCHAIN/bin/llvm-ranlib'
 strip = '$TOOLCHAIN/bin/llvm-strip'
 nasm = 'nasm'
+gperf = 'gperf'
 pkgconfig = 'false'
 
 [host_machine]
