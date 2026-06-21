@@ -19,6 +19,7 @@
 #include "config.h"
 #include "ass_compat.h"
 
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,9 +44,41 @@ static inline int32_t argtoi32(struct arg arg)
     return value;
 }
 
+static inline bool argtod_int_fast(struct arg arg, double *value)
+{
+    char *p = arg.start;
+    while (p < arg.end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r'))
+        p++;
+
+    bool neg = false;
+    if (p < arg.end && (*p == '+' || *p == '-'))
+        neg = *p++ == '-';
+
+    if (p >= arg.end || *p < '0' || *p > '9')
+        return false;
+
+    const uint64_t max_exact = (uint64_t) 1 << DBL_MANT_DIG;
+    uint64_t acc = 0;
+    do {
+        uint64_t digit = *p++ - '0';
+        if (acc > (max_exact - digit) / 10)
+            return false;
+        acc = 10 * acc + digit;
+    } while (p < arg.end && *p >= '0' && *p <= '9');
+
+    if (p < arg.end && (*p == '.' || *p == 'e' || *p == 'E'))
+        return false;
+
+    *value = neg ? -(double) acc : (double) acc;
+    return true;
+}
+
 static inline double argtod(struct arg arg)
 {
     double value;
+    if (argtod_int_fast(arg, &value))
+        return value;
     mystrtod(&arg.start, &value);
     return value;
 }
