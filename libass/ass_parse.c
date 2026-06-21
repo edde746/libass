@@ -587,6 +587,7 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->frz =
                     state->style->Angle;
         } else if (tag("fn")) {
+            ASS_StringView old_family = state->family;
             char *start = args->start;
             if (nargs && strncmp(start, "0", args->end - start)) {
                 skip_spaces(&start);
@@ -596,7 +597,8 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
                 state->family.str = state->style->FontName;
                 state->family.len = strlen(state->style->FontName);
             }
-            ass_update_font(state);
+            if (!ass_string_equal(old_family, state->family))
+                ass_update_font(state);
         } else if (tag("alpha")) {
             int i;
             if (nargs) {
@@ -859,14 +861,18 @@ char *ass_parse_tags(RenderContext *state, char *p, char *end, double pwr,
             int32_t val = argtoi32(*args);
             if (!nargs || !(val == 0 || val == 1 || val >= 100))
                 val = state->style->Bold;
-            state->bold = val;
-            ass_update_font(state);
+            if (state->bold != val) {
+                state->bold = val;
+                ass_update_font(state);
+            }
         } else if (tag("i")) {
             int32_t val = argtoi32(*args);
             if (!nargs || !(val == 0 || val == 1))
                 val = state->style->Italic;
-            state->italic = val;
-            ass_update_font(state);
+            if (state->italic != val) {
+                state->italic = val;
+                ass_update_font(state);
+            }
         } else if (tag("kt")) {
             // v4++
             double val = 0;
