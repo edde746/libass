@@ -288,6 +288,35 @@ static bool parse_vector_clip(RenderContext *state,
     return true;
 }
 
+static inline bool parse_simple_hex_tag(char *str, int32_t *value)
+{
+    char *p = str;
+    while (*p == ' ' || *p == '\t' || *p == '\n' ||
+            *p == '\v' || *p == '\f' || *p == '\r')
+        p++;
+    if (*p == '+' || *p == '-' || (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')))
+        return false;
+
+    int32_t result = 0;
+    while (1) {
+        int digit;
+        if (*p >= '0' && *p <= '9')
+            digit = *p - '0';
+        else if (*p >= 'a' && *p <= 'f')
+            digit = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F')
+            digit = *p - 'A' + 10;
+        else
+            break;
+        if (result > (INT32_MAX - digit) / 16)
+            return false;
+        result = 16 * result + digit;
+        p++;
+    }
+    *value = result;
+    return true;
+}
+
 static int32_t parse_alpha_tag(char *str)
 {
     int32_t alpha = 0;
@@ -295,7 +324,8 @@ static int32_t parse_alpha_tag(char *str)
     while (*str == '&' || *str == 'H')
         ++str;
 
-    mystrtoi32(&str, 16, &alpha);
+    if (!parse_simple_hex_tag(str, &alpha))
+        mystrtoi32(&str, 16, &alpha);
     return alpha;
 }
 
@@ -306,7 +336,8 @@ static uint32_t parse_color_tag(char *str)
     while (*str == '&' || *str == 'H')
         ++str;
 
-    mystrtoi32(&str, 16, &color);
+    if (!parse_simple_hex_tag(str, &color))
+        mystrtoi32(&str, 16, &color);
     return ass_bswap32((uint32_t) color);
 }
 
