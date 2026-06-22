@@ -9,6 +9,9 @@ ANDROID_ABIS="${ANDROID_ABIS:-arm64-v8a armeabi-v7a x86 x86_64}"
 VERSION="$(tr -d '[:space:]' < "$ROOT/RELEASEVERSION")"
 PACKAGE_ROOT="$BUILD_ROOT/package/libass-android-$VERSION"
 TOOLCHAIN=""
+# NDK prebuilt host tag (Linux CI vs local macOS dev; NDK ships darwin-x86_64 even on Apple Silicon).
+HOST_TAG="linux-x86_64"
+[ "$(uname -s)" = "Darwin" ] && HOST_TAG="darwin-x86_64"
 
 die() {
     echo "error: $*" >&2
@@ -37,7 +40,7 @@ find_android_ndk() {
         "${ANDROID_NDK_ROOT:-}" \
         "${ANDROID_NDK_LATEST_HOME:-}"
     do
-        if [ -n "$candidate" ] && [ -x "$candidate/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" ]; then
+        if [ -n "$candidate" ] && [ -x "$candidate/toolchains/llvm/prebuilt/$HOST_TAG/bin/llvm-ar" ]; then
             printf '%s\n' "$candidate"
             return
         fi
@@ -45,7 +48,7 @@ find_android_ndk() {
 
     if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/ndk" ]; then
         candidate="$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
-        if [ -n "$candidate" ] && [ -x "$candidate/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" ]; then
+        if [ -n "$candidate" ] && [ -x "$candidate/toolchains/llvm/prebuilt/$HOST_TAG/bin/llvm-ar" ]; then
             printf '%s\n' "$candidate"
             return
         fi
@@ -60,13 +63,13 @@ ensure_wraps() {
     meson wrap update-db
 
     local wrap
-    for wrap in freetype2 fribidi harfbuzz libunibreak; do
+    for wrap in freetype2 fribidi harfbuzz libunibreak fontconfig expat; do
         if [ ! -f "subprojects/$wrap.wrap" ]; then
             meson wrap install "$wrap"
         fi
     done
 
-    meson subprojects download freetype2 fribidi harfbuzz libunibreak
+    meson subprojects download freetype2 fribidi harfbuzz libunibreak fontconfig expat
 }
 
 android_abi_settings() {
@@ -139,7 +142,7 @@ EOF
 common_meson_options() {
     printf '%s\n' \
         --buildtype=release \
-        --wrap-mode=forcefallback \
+        --wrap-mode=default \
         -Ddefault_library=static \
         -Db_staticpic=true \
         -Dtest=disabled \
@@ -147,11 +150,18 @@ common_meson_options() {
         -Dprofile=disabled \
         -Dfuzz=disabled \
         -Dcheckasm=disabled \
-        -Dfontconfig=disabled \
+        -Dfontconfig=enabled \
         -Ddirectwrite=disabled \
         -Dcoretext=disabled \
         -Dlibunibreak=enabled \
         -Drequire-system-font-provider=false \
+        -Dfontconfig:doc=disabled \
+        -Dfontconfig:nls=disabled \
+        -Dfontconfig:tests=disabled \
+        -Dfontconfig:tools=disabled \
+        -Dfontconfig:cache-build=disabled \
+        -Dfontconfig:iconv=disabled \
+        -Dfontconfig:xml-backend=expat \
         -Dharfbuzz:chafa=disabled \
         -Dharfbuzz:docs=disabled \
         -Dharfbuzz:icu=disabled \
@@ -222,7 +232,7 @@ copy_licenses() {
     mkdir -p "$dest/libass"
     cp "$ROOT/COPYING" "$dest/libass/"
 
-    for name in freetype fribidi harfbuzz libunibreak; do
+    for name in freetype fribidi harfbuzz libunibreak fontconfig expat; do
         subdir="$(find "$ROOT/subprojects" -mindepth 1 -maxdepth 1 -type d -name "$name*" | sort | head -n 1)"
         [ -n "$subdir" ] || continue
         mkdir -p "$dest/$name"
@@ -249,9 +259,9 @@ $(
 )
 
 Each \`libass.a\` is a combined static archive built from libass plus the
-WrapDB FreeType, FriBidi, HarfBuzz, and libunibreak fallback dependencies used
-by the CI build. Public libass headers are in \`include/ass\`, and per-ABI
-pkg-config files are in \`lib/<abi>/pkgconfig\`.
+WrapDB FreeType, FriBidi, HarfBuzz, libunibreak, Fontconfig, and Expat fallback
+dependencies used by the CI build. Public libass headers are in \`include/ass\`,
+and per-ABI pkg-config files are in \`lib/<abi>/pkgconfig\`.
 EOF
 }
 
@@ -297,7 +307,7 @@ build_abi() {
 }
 
 main() {
-    TOOLCHAIN="$(find_android_ndk)/toolchains/llvm/prebuilt/linux-x86_64"
+    TOOLCHAIN="$(find_android_ndk)/toolchains/llvm/prebuilt/$HOST_TAG"
     [ -x "$TOOLCHAIN/bin/llvm-ar" ] || die "invalid Android LLVM toolchain: $TOOLCHAIN"
 
     rm -rf "$PACKAGE_ROOT"
