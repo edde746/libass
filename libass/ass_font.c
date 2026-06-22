@@ -302,6 +302,8 @@ uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol)
  */
 uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol)
 {
+    ass_font_lock(font);
+
     FT_Face face = font->faces[face_index];
 
     GlyphIndexCacheEntry *cache = font->index_cache[face_index];
@@ -316,8 +318,11 @@ uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol
         // Mix the codepoint to spread the small ASCII/BMP range across slots.
         slot = (symbol * 2654435761u) & (ASS_GLYPH_INDEX_CACHE_SIZE - 1);
         GlyphIndexCacheEntry *e = &cache[slot];
-        if (e->index && e->symbol == symbol)
-            return e->index - 1;
+        if (e->index && e->symbol == symbol) {
+            uint32_t index = e->index - 1;
+            ass_font_unlock(font);
+            return index;
+        }
     }
 
     uint32_t index = ass_font_index_magic(face, symbol);
@@ -330,6 +335,7 @@ uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol
         e->index = index + 1;  // store +1 so 0 marks an empty slot
     }
 
+    ass_font_unlock(font);
     return index;
 }
 
@@ -704,7 +710,6 @@ static void ass_glyph_italicize(FT_Face face)
  * \brief Get glyph and face index
  * Finds a face that has the requested codepoint and returns both face
  * and glyph index.
- * Must be called under lock.
  */
 int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                        uint32_t symbol, int *face_index, int *glyph_index)
@@ -743,6 +748,8 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
         face_idx = *face_index = add_face(fontsel, font, symbol);
         if (face_idx >= 0) {
             face = font->faces[face_idx];
+
+            ass_font_lock(font);
             index = ass_font_index_magic(face, symbol);
             if (index)
                 index = FT_Get_Char_Index(face, index);
@@ -763,6 +770,8 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                     if (index) break;
                 }
             }
+            ass_font_unlock(font);
+
             if (index == 0) {
                 ass_msg(font->library, MSGL_ERR,
                         "Glyph 0x%X not found in font for (%.*s, %d, %d)",
