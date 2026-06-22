@@ -175,7 +175,7 @@ if not threads_opt.disabled()
     if host_system in ['windows', 'cygwin']
         conf.set('CONFIG_W32THREAD', 1)
         enable_threads = true
-    elif host_system in ['darwin', 'linux', 'sunos', 'haiku', 'gnu', 'dragonfly'] or host_system.endswith('bsd')
+    elif host_system in ['darwin', 'linux', 'sunos', 'haiku', 'gnu', 'dragonfly', 'android'] or host_system.endswith('bsd')
         if have_stdatomic
             thread_dep = dependency('threads')
             if thread_dep.found()

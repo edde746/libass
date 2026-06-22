@@ -1,3 +1,7 @@
+libass (0.18.1)
+ * Enable threaded rendering in Meson-based Android builds
+ * Include Fontconfig in the Android static release package
+
 libass (0.18.0)
  * Add thread-safe cache and font access internals, plus support for per-event
    threaded rendering
