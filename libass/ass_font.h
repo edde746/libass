@@ -45,10 +45,34 @@ typedef struct ass_font ASS_Font;
 // the same codepoint on every frame. Must be a power of two.
 #define ASS_GLYPH_INDEX_CACHE_SIZE 512
 
+// The hit path is read LOCK-FREE: a single relaxed 64-bit atomic load returns
+// a tear-free snapshot of the packed (symbol, index) pair, so the common warm-
+// playback case no longer takes the font mutex. Safety:
+//  - the (symbol -> index) mapping is fixed for a face's lifetime, so every
+//    fully-stored tag is a correct answer (a hit is always right);
+//  - the whole pair is one 64-bit atomic value, so no torn/half-updated state
+//    is ever observed (a miss simply falls back to the locked path);
+//  - the entry array is invalidated in place (never freed mid-life), so a
+//    lock-free reader can never dereference freed memory.
+// tag layout: high 32 bits = symbol, low 32 bits = index + 1 (0 == empty slot).
 typedef struct {
-    uint32_t symbol;  // Unicode codepoint that was looked up
-    uint32_t index;   // FT_Get_Char_Index() result + 1; 0 means empty slot
+    _Atomic uint64_t tag;
 } GlyphIndexCacheEntry;
+
+static inline uint64_t ass_glyph_index_pack(uint32_t symbol, uint32_t index)
+{
+    return ((uint64_t) symbol << 32) | (uint32_t) (index + 1);
+}
+
+// Enable the lock-free hit path only where 64-bit atomics are truly lock-free
+// (all 64-bit targets: arm64, x86_64). On 32-bit targets the function still
+// works, it just always takes the mutex (the tag is still accessed atomically,
+// but under the lock, so no torn reads occur).
+#if defined(ATOMIC_LLONG_LOCK_FREE) && ATOMIC_LLONG_LOCK_FREE == 2
+#define ASS_GLYPH_INDEX_FAST_PATH 1
+#else
+#define ASS_GLYPH_INDEX_FAST_PATH 0
+#endif
 
 struct ass_font {
     ASS_FontDesc desc;
@@ -57,7 +81,7 @@ struct ass_font {
     int faces_uid[ASS_FONT_MAX_FACES];
     FT_Face faces[ASS_FONT_MAX_FACES];
     struct hb_font_t *hb_fonts[ASS_FONT_MAX_FACES];
-    GlyphIndexCacheEntry *index_cache[ASS_FONT_MAX_FACES];
+    GlyphIndexCacheEntry *_Atomic index_cache[ASS_FONT_MAX_FACES];
     _Atomic AtomicInt n_faces;
 
 #if ENABLE_THREADS

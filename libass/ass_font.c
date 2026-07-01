@@ -297,46 +297,74 @@ uint32_t ass_font_index_magic(FT_Face face, uint32_t symbol)
  *
  * The cache is keyed only by (face, symbol). This is valid because a face's
  * active charmap is fixed after ass_charmap_magic() runs in add_face(); the
- * sole later mutation (the broken-font fallback in ass_font_get_index) clears
- * the affected face's cache.
+ * sole later mutation (the broken-font fallback in ass_font_get_index)
+ * invalidates the affected face's entries in place.
+ *
+ * The cache-HIT path is read lock-free (see GlyphIndexCacheEntry above); the
+ * miss path takes the font mutex and does FT_Get_Char_Index.
  */
 uint32_t ass_font_get_char_index(ASS_Font *font, int face_index, uint32_t symbol)
 {
-    ass_font_lock(font);
+    GlyphIndexCacheEntry *cache = atomic_load_explicit(&font->index_cache[face_index],
+                                                       memory_order_acquire);
 
-    FT_Face face = font->faces[face_index];
-
-    GlyphIndexCacheEntry *cache = font->index_cache[face_index];
     if (!cache) {
-        cache = calloc(ASS_GLYPH_INDEX_CACHE_SIZE, sizeof(*cache));
-        font->index_cache[face_index] = cache;
-        // On allocation failure just fall through to the uncached path.
-    }
-
-    unsigned slot = 0;
-    if (cache) {
-        // Mix the codepoint to spread the small ASCII/BMP range across slots.
-        slot = (symbol * 2654435761u) & (ASS_GLYPH_INDEX_CACHE_SIZE - 1);
-        GlyphIndexCacheEntry *e = &cache[slot];
-        if (e->index && e->symbol == symbol) {
-            uint32_t index = e->index - 1;
+        // Lazy allocation: must happen under the lock (it publishes the array
+        // pointer to other threads). Other readers will observe it via the
+        // atomic acquire load above.
+        ass_font_lock(font);
+        cache = atomic_load_explicit(&font->index_cache[face_index], memory_order_relaxed);
+        if (!cache) {
+            cache = calloc(ASS_GLYPH_INDEX_CACHE_SIZE, sizeof(*cache));
+            atomic_store_explicit(&font->index_cache[face_index], cache, memory_order_release);
+        }
+        ass_font_unlock(font);
+        if (!cache) {
+            // Allocation failed: behave exactly like the uncached path.
+            ass_font_lock(font);
+            FT_Face face = font->faces[face_index];
+            uint32_t index = ass_font_index_magic(face, symbol);
+            if (index)
+                index = FT_Get_Char_Index(face, index);
             ass_font_unlock(font);
             return index;
         }
     }
 
-    uint32_t index = ass_font_index_magic(face, symbol);
-    if (index)
-        index = FT_Get_Char_Index(face, index);
+    unsigned slot = (symbol * 2654435761u) & (ASS_GLYPH_INDEX_CACHE_SIZE - 1);
+    GlyphIndexCacheEntry *e = &cache[slot];
+    uint64_t tag;
+    uint32_t ip1;
 
-    if (cache) {
-        GlyphIndexCacheEntry *e = &cache[slot];
-        e->symbol = symbol;
-        e->index = index + 1;  // store +1 so 0 marks an empty slot
+#if ASS_GLYPH_INDEX_FAST_PATH
+    // Lock-free hit: a relaxed atomic load is a tear-free snapshot of the
+    // packed (symbol, index+1) pair. Every stored pair is correct for this
+    // face, so a hit needs no mutex and no further synchronization.
+    tag = atomic_load_explicit(&e->tag, memory_order_relaxed);
+    ip1 = (uint32_t) tag;
+    if (ip1 && (uint32_t) (tag >> 32) == symbol)
+        return ip1 - 1;
+#endif
+
+    ass_font_lock(font);
+
+    // Re-check under the lock: another thread may have filled this slot since
+    // the (relaxed, or absent) probe above, and on the non-fast-path this is
+    // the canonical read.
+    tag = atomic_load_explicit(&e->tag, memory_order_relaxed);
+    ip1 = (uint32_t) tag;
+    if (!(ip1 && (uint32_t) (tag >> 32) == symbol)) {
+        FT_Face face = font->faces[face_index];
+        uint32_t index = ass_font_index_magic(face, symbol);
+        if (index)
+            index = FT_Get_Char_Index(face, index);
+        atomic_store_explicit(&e->tag, ass_glyph_index_pack(symbol, index),
+                              memory_order_relaxed);
+        ip1 = (uint32_t) index + 1;  // for the return below
     }
 
     ass_font_unlock(font);
-    return index;
+    return ip1 - 1;
 }
 
 static void set_font_metrics(FT_Face face)
@@ -565,7 +593,7 @@ size_t ass_font_construct(void *key, void *value, void *priv)
     font->ftlibrary = render_priv->ftlibrary;
     atomic_init(&font->n_faces, 0);
     for (int i = 0; i < ASS_FONT_MAX_FACES; i++)
-        font->index_cache[i] = NULL;
+        atomic_init(&font->index_cache[i], NULL);
     font->desc.family = desc->family;
     font->desc.bold = desc->bold;
     font->desc.italic = desc->italic;
@@ -759,9 +787,24 @@ int ass_font_get_index(ASS_FontSelector *fontsel, ASS_Font *font,
                     "Glyph 0x%X not found, broken font? Trying all charmaps", symbol);
                 // The charmap is about to change for this face, so any cached
                 // symbol -> index results computed under the old charmap are
-                // now invalid: drop them.
-                free(font->index_cache[face_idx]);
-                font->index_cache[face_idx] = NULL;
+                // now invalid. Invalidate them IN PLACE rather than freeing
+                // the array: the entry array must stay at a stable address for
+                // the font's lifetime so the lock-free hit path can never
+                // dereference freed memory. (The array is freed once, at
+                // teardown in ass_font_clear.)
+                //
+                // Each entry is zeroed with its own atomic store so that a
+                // concurrent lock-free reader never observes a half-written
+                // (torn) tag. This runs before FT_Set_Charmap() below, so any
+                // reader that still sees an old (non-zeroed) entry does so while
+                // the charmap is still the one that entry was validly computed
+                // under.
+                GlyphIndexCacheEntry *ic = atomic_load_explicit(
+                        &font->index_cache[face_idx], memory_order_relaxed);
+                if (ic) {
+                    for (int j = 0; j < ASS_GLYPH_INDEX_CACHE_SIZE; j++)
+                        atomic_store_explicit(&ic[j].tag, 0, memory_order_relaxed);
+                }
                 for (i = 0; i < face->num_charmaps; i++) {
                     FT_Set_Charmap(face, face->charmaps[i]);
                     index = ass_font_index_magic(face, symbol);
@@ -840,7 +883,7 @@ void ass_font_clear(ASS_Font *font)
             FT_Done_Face(font->faces[i]);
         if (font->hb_fonts[i])
             hb_font_destroy(font->hb_fonts[i]);
-        free(font->index_cache[i]);
+        free(atomic_load_explicit(&font->index_cache[i], memory_order_relaxed));
     }
 
 #if ENABLE_THREADS
