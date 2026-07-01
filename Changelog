@@ -1,3 +1,12 @@
+libass (0.18.2)
+ * Add opt-in ASS_FEATURE_CACHE_LAYOUT layout cache, reusing combined bitmaps
+   and emitted images on cache hits
+ * Add further renderer, font, and shaper performance improvements
+ * Backport upstream fixes: line-wrapping out-of-bounds read/write, undefined
+   behavior in whitespace trimming, and negative ReadOrder handling
+ * Include legacy Arabic charmap sources in distribution tarballs
+ * Improve Meson and CI build coverage
+
 libass (0.18.1)
  * Enable threaded rendering in Meson-based Android builds
  * Include Fontconfig in the Android static release package
