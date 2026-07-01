@@ -54,10 +54,16 @@
 
 typedef struct image_pool ImagePool;
 
+// Ref-counted read-only pixel buffer shared by cached emitted images (opaque
+// here; defined in ass_render.c). Lets the layout-cache clone owned-buffer
+// images (vector clip / opaque-box background) without a per-clone pixel copy.
+typedef struct shared_buffer SharedBuffer;
+
 typedef struct {
     ASS_Image result;
     CompositeHashValue *source;
-    unsigned char *buffer;
+    unsigned char *buffer;      // owned aligned buffer, ass_aligned_free'd on free
+    SharedBuffer *shared;       // if set: shared read-only master, unref'd on free (buffer NULL)
     size_t ref_count;
     ImagePool *pool;            // owning recycler, or NULL if heap-allocated
 } ASS_ImagePriv;
@@ -352,6 +358,21 @@ typedef struct {
 // Snapshots are owned by a per-renderer intrusive registry (reg_next/reg_prev)
 // so the renderer can dec_ref/free them while its caches are still alive,
 // regardless of renderer-vs-track teardown order.
+// One cached emitted ASS_Image (post render_text + add_background) for a static
+// event, so a hit can skip render_text entirely. A clone into a fresh pool shell
+// either inc_refs the pinned composite (source-backed) or takes a ref on a shared
+// read-only master buffer (owned-buffer: vector clip / opaque-box background) —
+// no per-clone pixel copy. Because collision shift and every other post-emission
+// consumer only offset the bitmap pointer (never write pixels), and source-backed
+// composite buffers are already shared read-only across a frame, sharing an owned
+// buffer read-only is safe; the ref keeps the master alive for exactly as long as
+// any emitted image points into it (surviving snapshot free / gen bump).
+typedef struct {
+    ASS_Image result;            // template; .bitmap into composite or master, .next per clone
+    CompositeHashValue *source;  // source-backed: pinned composite; NULL if shared-buffer
+    SharedBuffer *shared;        // shared-buffer: master (snapshot holds a ref); NULL if source-backed
+} CachedImage;
+
 typedef struct layout_snapshot {
     uint32_t gen;               // renderer layout_gen this was built under
 
@@ -369,6 +390,15 @@ typedef struct layout_snapshot {
     // `image` (which owns bm/bm_o/bm_s) so they survive LRU eviction.
     CombinedBitmapInfo *combined_bitmaps;
     unsigned n_bitmaps;
+
+    // Cached emitted ASS_Image list, letting a hit skip render_text/add_background
+    // too. images_cached is false when the capture failed (fall back to render_text
+    // on hits). Each cached image is either source-backed (borrows the composite
+    // pinned via combined_bitmaps) or shared-buffer (owns one SharedBuffer ref for
+    // a vector-clip / opaque-box-background master).
+    CachedImage *images;
+    unsigned n_images;
+    bool images_cached;
 
     // RenderContext scalars read at/after the cache boundary
     double blur_scale_x, blur_scale_y;

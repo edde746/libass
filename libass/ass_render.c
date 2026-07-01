@@ -433,6 +433,7 @@ static ASS_ImagePriv *image_pool_alloc(ImagePool *pool)
     }
 
     img->pool = pool;
+    img->shared = NULL;   // only clone_image_snapshot sets this; recycled shells may be stale
     return img;
 }
 
@@ -462,6 +463,48 @@ static ASS_Image *my_draw_bitmap(ImagePool *pool, unsigned char *bitmap,
     img->ref_count = 0;
 
     return &img->result;
+}
+
+// Ref-counted read-only pixel buffer backing cloned owned-buffer images (vector
+// clip / opaque-box background) in the layout cache. The capturing snapshot holds
+// one ref; each clone holds one ref; the buffer (and this header) is freed only
+// when the last ref drops. So a shared master always outlives every emitted image
+// that points into it, even if the snapshot is freed (gen bump / teardown) while
+// the user still holds a rendered frame — matching how emitted images already
+// outlive their source composite. refs is atomic to match the multi-threaded
+// render/free of pooled images.
+struct shared_buffer {
+    _Atomic AtomicInt refs;
+    unsigned char *data;
+};
+
+static SharedBuffer *shared_buffer_new(unsigned align,
+                                       const unsigned char *src, size_t size)
+{
+    SharedBuffer *sb = malloc(sizeof(*sb));
+    if (!sb)
+        return NULL;
+    sb->data = ass_aligned_alloc(align, size, false);
+    if (!sb->data) {
+        free(sb);
+        return NULL;
+    }
+    memcpy(sb->data, src, size);
+    atomic_init(&sb->refs, 1);
+    return sb;
+}
+
+static void shared_buffer_ref(SharedBuffer *sb)
+{
+    inc_ref(&sb->refs);
+}
+
+static void shared_buffer_unref(SharedBuffer *sb)
+{
+    if (dec_ref(&sb->refs) == 0) {
+        ass_aligned_free(sb->data);
+        free(sb);
+    }
 }
 
 /**
@@ -3215,6 +3258,13 @@ static void layout_snapshot_free_contents(LayoutSnapshot *snap)
         if (snap->combined_bitmaps[i].image)
             ass_cache_dec_ref(snap->combined_bitmaps[i].image);
     }
+    // Drop the snapshot's ref on each shared master; source-backed cached images
+    // borrow the composite pinned via combined_bitmaps above (no per-image ref).
+    for (unsigned i = 0; i < snap->n_images; i++) {
+        if (snap->images[i].shared)
+            shared_buffer_unref(snap->images[i].shared);
+    }
+    free(snap->images);
     free(snap->combined_bitmaps);
     free(snap->glyphs);
     free(snap->lines);
@@ -3485,6 +3535,98 @@ static bool restore_layout_snapshot(RenderContext *state, const LayoutSnapshot *
     *device_x = snap->device_x;
     *device_y = snap->device_y;
     *bbox = snap->bbox;
+    return true;
+}
+
+static ASS_Image *ass_free_image(ASS_Image *img);
+
+// Capture the emitted ASS_Image list of a static event (post render_text +
+// add_background) so a later hit can skip render_text entirely. Runs on the miss
+// frame, after the combined snapshot is built. Each image is either source-backed
+// (borrows the composite pinned via combined_bitmaps) or owns a buffer (vector
+// clip / opaque-box background) whose pixels are captured once into a ref-counted
+// read-only SharedBuffer (no per-clone copy). On any allocation failure the
+// partial capture is rolled back and images_cached stays false, so hits fall back
+// to render_text.
+static void build_image_snapshot(RenderContext *state, LayoutSnapshot *snap,
+                                 ASS_Image *imgs)
+{
+    unsigned n = 0;
+    for (ASS_Image *cur = imgs; cur; cur = cur->next)
+        n++;
+    if (!n) {
+        snap->images_cached = true;   // trivial (empty) list is a valid cache
+        return;
+    }
+    CachedImage *arr = malloc(n * sizeof(CachedImage));
+    if (!arr)
+        return;
+    unsigned align = 1 << state->renderer->engine.align_order;
+    unsigned i = 0;
+    for (ASS_Image *cur = imgs; cur; cur = cur->next, i++) {
+        ASS_ImagePriv *priv = (ASS_ImagePriv *) cur;
+        CachedImage *ci = &arr[i];
+        ci->result = *cur;            // struct fields incl. the bitmap pointer
+        ci->result.next = NULL;
+        ci->source = priv->source;    // NULL => owned-buffer; else pinned composite
+        ci->shared = NULL;
+        if (!priv->source) {
+            // Owned-buffer image: bitmap == buffer (start of the aligned alloc),
+            // valid extent stride*(h-1)+w per the ASS_Image contract.
+            size_t size = cur->h > 0 ? (size_t) cur->stride * (cur->h - 1) + cur->w : 0;
+            SharedBuffer *sb = size ? shared_buffer_new(align, cur->bitmap, size) : NULL;
+            if (!sb) {                // OOM or degenerate 0-size owned buffer: don't cache
+                for (unsigned k = 0; k < i; k++)
+                    if (arr[k].shared)
+                        shared_buffer_unref(arr[k].shared);
+                free(arr);
+                return;
+            }
+            ci->shared = sb;
+            ci->result.bitmap = sb->data;   // clones point into the shared master
+        }
+        // source-backed: ci->result.bitmap keeps its pointer into the pinned
+        // composite buffer (kept alive by the combined snapshot's inc_ref).
+    }
+    snap->images = arr;
+    snap->n_images = n;
+    snap->images_cached = true;
+}
+
+// Reconstruct the cached emitted ASS_Image list into fresh pool shells. Source-
+// backed images inc_ref the pinned composite; owned-buffer images take a ref on
+// the shared read-only master — so every emitted image independently keeps its
+// bitmap alive (surviving snapshot free / gen bump), exactly as render_text's
+// output does, with no per-clone pixel copy. Returns the list via *out and true;
+// on pool-shell OOM frees the partial list and returns false (caller runs
+// render_text instead).
+static bool clone_image_snapshot(RenderContext *state, const LayoutSnapshot *snap,
+                                 ASS_Image **out)
+{
+    ASS_Image *head = NULL, **tail = &head;
+    for (unsigned i = 0; i < snap->n_images; i++) {
+        const CachedImage *ci = &snap->images[i];
+        ASS_ImagePriv *img = image_pool_alloc(state->image_pool);
+        if (!img) {
+            for (ASS_Image *cur = head; cur; )
+                cur = ass_free_image(cur);
+            *out = NULL;
+            return false;
+        }
+        img->result = ci->result;     // incl. bitmap ptr into composite or master
+        img->result.next = NULL;
+        img->ref_count = 0;
+        img->buffer = NULL;
+        img->source = ci->source;
+        img->shared = ci->shared;
+        if (ci->source)
+            ass_cache_inc_ref(ci->source);
+        else
+            shared_buffer_ref(ci->shared);
+        *tail = &img->result;         // link before next iter so fail path frees it
+        tail = &img->result.next;
+    }
+    *out = head;
     return true;
 }
 
@@ -3845,10 +3987,36 @@ render_combined:
         + 2 * text_info->border_x + 0.5;
     event_images->detect_collisions = state->detect_collisions;
     event_images->shift_direction = (valign == VALIGN_SUB) ? -1 : 1;
-    event_images->imgs = render_text(state);
 
-    if (state->border_style == 4)
-        add_background(state, event_images);
+    // Image-list cache: on a hit for a static event, clone the cached emitted
+    // images (skipping render_text/add_background). Any per-frame collision shift
+    // is applied by the frame assembly to this (pre-shift) clone exactly as it is
+    // to render_text's output, so caching stays bit-exact.
+    //
+    // Honor the same ownership/generation invariant as the restore paths (3756,
+    // 3956): only clone THIS renderer's own, current-generation snapshot. A
+    // foreign snapshot (shared track rendered by another renderer) was never
+    // restored into this frame's text_info — its images belong to a different
+    // config — and is also mutable state guarded by the OTHER renderer's lock, so
+    // cloning it would emit wrong output and race its free. Fall through to
+    // render_text instead, exactly as the miss path does for a foreign event.
+    if (!built_layout && rp && rp->layout && !foreign_snapshot &&
+            rp->layout->gen == render_priv->layout_gen &&
+            rp->layout->images_cached &&
+            clone_image_snapshot(state, rp->layout, &event_images->imgs)) {
+        // cached list already includes any border-style-4 background
+    } else {
+        event_images->imgs = render_text(state);
+
+        if (state->border_style == 4)
+            add_background(state, event_images);
+
+        // On the miss frame, capture the emitted (pre-shift) list so later hits
+        // can clone it — only when the snapshot survived (rp->layout != NULL, so
+        // its inc_ref keeps every source-backed image's composite alive).
+        if (built_layout && rp && rp->layout)
+            build_image_snapshot(state, rp->layout, event_images->imgs);
+    }
 
     ass_shaper_cleanup(state->shaper, text_info);
     free_render_context(state);
@@ -4391,7 +4559,10 @@ static ASS_Image *ass_free_image(ASS_Image *img) {
 
     ASS_ImagePriv *priv = (ASS_ImagePriv *) img;
     ass_cache_dec_ref(priv->source);
-    ass_aligned_free(priv->buffer);
+    if (priv->shared)
+        shared_buffer_unref(priv->shared);   // cloned owned-buffer image (buffer is NULL)
+    else
+        ass_aligned_free(priv->buffer);
     ImagePool *pool = priv->pool;
     if (pool) {
         // Recycle the shell instead of returning it to the heap.
