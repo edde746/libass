@@ -1573,9 +1573,13 @@ static void calc_transform_matrix(RenderContext *state,
     double fry = ASS_PI / 180 * info->fry;
     double frz = ASS_PI / 180 * info->frz;
 
-    double sx = -sin(frx), cx = cos(frx);
-    double sy =  sin(fry), cy = cos(fry);
-    double sz = -sin(frz), cz = cos(frz);
+    double sx, cx, sy, cy, sz, cz;
+    if (frx == 0.) { sx = -0.0; cx = 1.0; }
+    else { sx = -sin(frx); cx = cos(frx); }
+    if (fry == 0.) { sy = 0.0;  cy = 1.0; }
+    else { sy =  sin(fry); cy = cos(fry); }
+    if (frz == 0.) { sz = -0.0; cz = 1.0; }
+    else { sz = -sin(frz); cz = cos(frz); }
 
     double fax = info->fax * info->scale_x / info->scale_y;
     double fay = info->fay * info->scale_y / info->scale_x;
