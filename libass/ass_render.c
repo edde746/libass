@@ -1698,6 +1698,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         snap_motion_cache_key(&key, pos);
 
     info->bm = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
+    if (!info->bm)
+        state->alloc_error = true;
     if (!info->bm || !info->bm->buffer)
         info->bm = NULL;
 
@@ -1817,6 +1819,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
     }
 
     key.outline = ass_cache_get(render_priv->cache.outline_cache, state->cache_client, &ol_key, render_priv);
+    if (!key.outline)
+        state->alloc_error = true;
     if (!key.outline || !key.outline->valid ||
             !quantize_transform(m, pos_o, offset, false, &key))
         return;
@@ -1824,6 +1828,8 @@ get_bitmap_glyph(RenderContext *state, GlyphInfo *info,
         snap_motion_cache_key(&key, pos_o);
 
     info->bm_o = ass_cache_get(render_priv->cache.bitmap_cache, state->cache_client, &key, state);
+    if (!info->bm_o)
+        state->alloc_error = true;
     if (!info->bm_o || !info->bm_o->buffer) {
         info->bm_o = NULL;
         *pos_o = *pos;
@@ -2767,6 +2773,7 @@ static void render_and_combine_glyphs(RenderContext *state,
     TextInfo *text_info = &state->text_info;
     int left = render_priv->settings.left_margin;
     device_x = (device_x - left) * render_priv->par_scale_x + left;
+    state->alloc_error = false;
     unsigned nb_bitmaps = 0;
     bool new_run = true;
     CombinedBitmapInfo *combined_info = text_info->combined_bitmaps;
@@ -2813,8 +2820,10 @@ static void render_and_combine_glyphs(RenderContext *state,
                 if (nb_bitmaps >= text_info->max_bitmaps) {
                     size_t old_size = text_info->max_bitmaps;
                     size_t new_size = 2 * old_size;
-                    if (!ASS_REALLOC_ARRAY(text_info->combined_bitmaps, new_size))
+                    if (!ASS_REALLOC_ARRAY(text_info->combined_bitmaps, new_size)) {
+                        state->alloc_error = true;
                         continue;
+                    }
 
                     text_info->max_bitmaps = new_size;
                     combined_info = text_info->combined_bitmaps;
@@ -2853,8 +2862,10 @@ static void render_and_combine_glyphs(RenderContext *state,
                 current_info->bitmap_count = 0;
                 if (!current_info->bitmaps) {
                     current_info->bitmaps = malloc(MAX_SUB_BITMAPS_INITIAL * sizeof(BitmapRef));
-                    if (!current_info->bitmaps)
+                    if (!current_info->bitmaps) {
+                        state->alloc_error = true;
                         continue;
+                    }
 
                     current_info->max_bitmap_count = MAX_SUB_BITMAPS_INITIAL;
                 }
@@ -2875,8 +2886,10 @@ static void render_and_combine_glyphs(RenderContext *state,
 
             if (current_info->bitmap_count >= current_info->max_bitmap_count) {
                 size_t new_size = 2 * current_info->max_bitmap_count;
-                if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size))
+                if (!ASS_REALLOC_ARRAY(current_info->bitmaps, new_size)) {
+                    state->alloc_error = true;
                     continue;
+                }
 
                 current_info->max_bitmap_count = new_size;
             }
@@ -2923,8 +2936,10 @@ static void render_and_combine_glyphs(RenderContext *state,
             info->bitmaps = NULL;
             info->max_bitmap_count = 0;
         }
-        if (!val)
+        if (!val) {
+            state->alloc_error = true;
             continue;
+        }
 
         if (val->bm.buffer)
             info->bm = &val->bm;
@@ -3196,6 +3211,11 @@ static void layout_snapshot_free_contents(LayoutSnapshot *snap)
         if (head->font)
             ass_cache_dec_ref(head->font);
     }
+    for (unsigned i = 0; i < snap->n_bitmaps; i++) {
+        if (snap->combined_bitmaps[i].image)
+            ass_cache_dec_ref(snap->combined_bitmaps[i].image);
+    }
+    free(snap->combined_bitmaps);
     free(snap->glyphs);
     free(snap->lines);
     free(snap->clip_drawing_text);
@@ -3468,6 +3488,87 @@ static bool restore_layout_snapshot(RenderContext *state, const LayoutSnapshot *
     return true;
 }
 
+// Extend a freshly-built layout snapshot with the combined-bitmap output of
+// render_and_combine_glyphs, so later frames skip that per-frame work too. Holds
+// an inc_ref on each group's composite `image` (which owns bm/bm_o/bm_s), just as
+// the snapshot holds outline/font refs. render_text() reads only bm/bm_o/bm_s,
+// x/y, c[], effect_*, and image, so the per-group `bitmaps` key array (owned by
+// the RenderContext) is not copied. Returns false on OOM (caller drops the
+// whole snapshot, so a surviving snapshot always carries its combined bitmaps).
+static bool build_combined_snapshot(LayoutSnapshot *snap, TextInfo *ti)
+{
+    unsigned n = ti->n_bitmaps;
+    // A group that produced a composite (image != NULL) but whose bm/bm_o/bm_s are
+    // all empty is an allocation-failure artifact: a successful composite of a
+    // non-empty group (bitmap_count > 0, guaranteed here — empty groups are
+    // skipped in render_and_combine_glyphs) always yields at least one non-empty
+    // buffer. Refuse to snapshot such an event: pinning (inc_ref) the empty
+    // composite would freeze the best-effort-degraded render on every later hit,
+    // defeating the self-heal a re-render gives once memory frees up. Falling back
+    // to running render_and_combine_glyphs each frame tracks the shared composite
+    // cache exactly as the non-cached path does.
+    for (unsigned i = 0; i < n; i++) {
+        CombinedBitmapInfo *s = &ti->combined_bitmaps[i];
+        if (s->image && !s->bm && !s->bm_o && !s->bm_s)
+            return false;
+    }
+    if (n) {
+        snap->combined_bitmaps = malloc(n * sizeof(CombinedBitmapInfo));
+        if (!snap->combined_bitmaps)
+            return false;
+        for (unsigned i = 0; i < n; i++) {
+            CombinedBitmapInfo *dst = &snap->combined_bitmaps[i];
+            *dst = ti->combined_bitmaps[i];
+            dst->bitmaps = NULL;          // key array belongs to the RenderContext
+            dst->max_bitmap_count = 0;
+            dst->bitmap_count = 0;
+            dst->reuse_bitmaps = false;
+            if (dst->image)
+                ass_cache_inc_ref(dst->image);
+        }
+    }
+    snap->n_bitmaps = n;
+    return true;
+}
+
+// Restore cached combined bitmaps into the live RenderContext, ready to skip
+// straight to render_text(). Copies only the fields render_text/add_background
+// read, preserving the context's reusable per-group `bitmaps` key arrays. The
+// composite `image` (and thus bm/bm_o/bm_s) is kept alive by the snapshot's ref.
+// Returns false on OOM (caller falls back to running render_and_combine_glyphs).
+static bool restore_combined_snapshot(RenderContext *state, const LayoutSnapshot *snap)
+{
+    TextInfo *ti = &state->text_info;
+    unsigned n = snap->n_bitmaps;
+    if (n > ti->max_bitmaps) {
+        unsigned old_max = ti->max_bitmaps;
+        unsigned new_max = n;
+        if (!ASS_REALLOC_ARRAY(ti->combined_bitmaps, new_max))
+            return false;
+        memset(ti->combined_bitmaps + old_max, 0,
+               (new_max - old_max) * sizeof(CombinedBitmapInfo));
+        ti->max_bitmaps = new_max;
+    }
+    for (unsigned i = 0; i < n; i++) {
+        CombinedBitmapInfo *dst = &ti->combined_bitmaps[i];
+        const CombinedBitmapInfo *src = &snap->combined_bitmaps[i];
+        dst->filter = src->filter;
+        dst->c[0] = src->c[0]; dst->c[1] = src->c[1];
+        dst->c[2] = src->c[2]; dst->c[3] = src->c[3];
+        dst->effect_type = src->effect_type;
+        dst->effect_timing = src->effect_timing;
+        dst->leftmost_x = src->leftmost_x;
+        dst->x = src->x;
+        dst->y = src->y;
+        dst->bm = src->bm;
+        dst->bm_o = src->bm_o;
+        dst->bm_s = src->bm_s;
+        dst->image = src->image;
+    }
+    ti->n_bitmaps = n;
+    return true;
+}
+
 /**
  * \brief Main ass rendering function, glues everything together
  * \param event event to render
@@ -3497,6 +3598,7 @@ ass_render_event(RenderContext *state, EventImages *event_images)
     double device_x = 0;
     double device_y = 0;
     ASS_DRect bbox;
+    bool built_layout = false;   // this frame built a fresh snapshot (miss path)
 
     // Layout cache (ASS_FEATURE_CACHE_LAYOUT): on a hit, restore the laid-out
     // state for this static event and skip the whole parse/shape/layout pipeline.
@@ -3514,6 +3616,11 @@ ass_render_event(RenderContext *state, EventImages *event_images)
                 restore_layout_snapshot(state, rp->layout, event,
                                         &device_x, &device_y, &bbox)) {
             valign = state->alignment & 12;
+            // A live snapshot always carries its combined bitmaps: restore them
+            // and skip render_and_combine_glyphs too. Only on an OOM growing the
+            // combined array do we fall back to running render_and_combine.
+            if (restore_combined_snapshot(state, rp->layout))
+                goto render_combined;
             goto render;
         }
         // Own snapshot but stale generation, or a restore that ran out of
@@ -3708,12 +3815,24 @@ ass_render_event(RenderContext *state, EventImages *event_images)
             !(state->evt_type & (EVENT_HSCROLL | EVENT_VSCROLL)) &&
             !event_has_time_dependent_tags(rp, event)) {
         build_layout_snapshot(state, rp, device_x, device_y, &bbox);
+        built_layout = rp->layout != NULL;
     }
     }   // --- end full layout pipeline (cache miss) ---
 
 render:
     render_and_combine_glyphs(state, device_x, device_y);
 
+    // Extend the fresh snapshot with the combined bitmaps just produced, so later
+    // frames skip render_and_combine too. If render_and_combine hit an allocation
+    // failure (its best-effort partial output would otherwise be frozen and the
+    // dropped glyphs lost on every future frame), or the copy itself OOMs, drop
+    // the whole snapshot so the next frame re-renders and self-heals. Either way
+    // the current frame is unaffected (it renders from the live text_info below).
+    if (built_layout &&
+            (state->alloc_error || !build_combined_snapshot(rp->layout, text_info)))
+        free_layout_snapshot(rp->layout);
+
+render_combined:
     // VSFilter does *not* shift lines with a border > margin to be within the
     // frame, so negative values for top and left may occur
     event_images->top = device_y - text_info->lines[0].asc - text_info->border_top;

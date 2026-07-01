@@ -240,6 +240,12 @@ struct render_context {
     CacheClient *cache_client;
     ImagePool *image_pool;
 
+    // Set by render_and_combine_glyphs/get_bitmap_glyph when an allocation
+    // (cache creation) fails mid-render, so its best-effort partial result is
+    // not frozen into the combined-bitmap snapshot (which would render the same
+    // dropped glyphs forever). Reset at the start of render_and_combine_glyphs.
+    bool alloc_error;
+
     ASS_Event *event;
     ASS_Style *style;
 
@@ -356,6 +362,13 @@ typedef struct layout_snapshot {
     int n_lines;
     double height;
     int border_top, border_bottom, border_x;
+
+    // Post-render_and_combine output: the combined bitmaps this event emits.
+    // Present iff the snapshot was fully built; lets a hit skip render_and_combine
+    // and jump straight to render_text. Holds an inc_ref on each group's composite
+    // `image` (which owns bm/bm_o/bm_s) so they survive LRU eviction.
+    CombinedBitmapInfo *combined_bitmaps;
+    unsigned n_bitmaps;
 
     // RenderContext scalars read at/after the cache boundary
     double blur_scale_x, blur_scale_y;
