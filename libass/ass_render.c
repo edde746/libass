@@ -81,6 +81,26 @@ static void image_pool_renderer_done(ImagePool *pool);
 static bool event_has_hard_overrides(ASS_Renderer *render_priv,
                                      ASS_Event *event);
 
+// Layout cache (ASS_FEATURE_CACHE_LAYOUT) — see ass_render.h:LayoutSnapshot.
+static void layout_cache_flush(ASS_Renderer *priv);
+static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv, ASS_Event *event);
+
+#if ENABLE_THREADS
+static inline void layout_cache_lock(ASS_Renderer *priv)
+{
+    if (priv->layout_cache_mutex_inited)
+        pthread_mutex_lock(&priv->layout_cache_mutex);
+}
+static inline void layout_cache_unlock(ASS_Renderer *priv)
+{
+    if (priv->layout_cache_mutex_inited)
+        pthread_mutex_unlock(&priv->layout_cache_mutex);
+}
+#else
+#define layout_cache_lock(priv) ((void) (priv))
+#define layout_cache_unlock(priv) ((void) (priv))
+#endif
+
 static void text_info_done(TextInfo* text_info)
 {
     if (text_info->combined_bitmaps)
@@ -201,6 +221,14 @@ ASS_Renderer *ass_renderer_init(ASS_Library *library)
 
     priv->mutex_inited = true;
 
+    // Must succeed before threads run: layout_cache_lock is a no-op while
+    // uninited, so failing here without disabling threading would leave the
+    // snapshot registry unsynchronized across workers. goto thread_fail forces
+    // the serial path, where the no-op lock is safe.
+    if (pthread_mutex_init(&priv->layout_cache_mutex, NULL) != 0)
+        goto thread_fail;
+    priv->layout_cache_mutex_inited = true;
+
     if (pthread_cond_init(&priv->main_cond, NULL) != 0)
         goto thread_fail;
 
@@ -271,6 +299,14 @@ void ass_renderer_done(ASS_Renderer *render_priv)
 
     ass_frame_unref(render_priv->images_root);
     ass_frame_unref(render_priv->prev_images_root);
+
+    // Free all live layout snapshots (dec_ref'ing held outline/font refs) while
+    // the caches are still alive, then drop the registry mutex.
+    layout_cache_flush(render_priv);
+#if ENABLE_THREADS
+    if (render_priv->layout_cache_mutex_inited)
+        pthread_mutex_destroy(&render_priv->layout_cache_mutex);
+#endif
 
     render_context_done(&render_priv->state);
 
@@ -1573,6 +1609,11 @@ static void calc_transform_matrix(RenderContext *state,
     double fry = ASS_PI / 180 * info->fry;
     double frz = ASS_PI / 180 * info->frz;
 
+    // Most glyphs are unrotated, yet sin/cos of the (zero) angles are still
+    // computed via libm on every glyph, before the bitmap cache lookup. Skip
+    // the calls when the angle is exactly 0. Bit-exact: ASS_PI/180 * 0 == +0.0,
+    // sin(+0.0) == +0.0, cos(+0.0) == 1.0, so -sin(0) == -0.0 etc.; we
+    // substitute those exact values (including the negative zero).
     double sx, cx, sy, cy, sz, cz;
     if (frx == 0.) { sx = -0.0; cx = 1.0; }
     else { sx = -sin(frx); cx = cos(frx); }
@@ -3100,6 +3141,333 @@ static void setup_shaper(ASS_Shaper *shaper, ASS_Renderer *render_priv)
             track->parser_priv->feature_flags & FEATURE_MASK(ASS_FEATURE_WHOLE_TEXT_LAYOUT));
 }
 
+// ---- Layout cache (ASS_FEATURE_CACHE_LAYOUT) ------------------------------
+//
+// For an event with no time-dependent overrides (and no scrolling transition),
+// the entire parse/shape/layout pipeline up to render_and_combine_glyphs is a
+// pure function of (event, renderer config). We snapshot its result on the
+// first render (a miss) and restore it on later frames (a hit), skipping the
+// pipeline. See ass_render.h:LayoutSnapshot for the storage/lifetime model.
+
+// Copy one laid-out glyph (cluster head or chain node) into snapshot/live
+// storage: drop the per-render bitmap pointers and the drawing-text view (both
+// unused past the cache boundary). Snapshot copies (take_ref) take a counted
+// ref on outline/font so they survive LRU eviction; live restore copies borrow.
+static void copy_layout_glyph(GlyphInfo *dst, const GlyphInfo *src, bool take_ref)
+{
+    *dst = *src;
+    dst->bm = dst->bm_o = NULL;
+    dst->drawing_text = (ASS_StringView) { NULL, 0 };
+    dst->next = NULL;
+    if (take_ref) {
+        if (dst->outline)
+            ass_cache_inc_ref(dst->outline);
+        if (dst->font)
+            ass_cache_inc_ref(dst->font);
+    }
+}
+
+// Free a cluster next-chain (the head struct itself is array-owned, kept).
+// Snapshot chains dec_ref their counted refs; live restore chains only borrow.
+static void free_layout_chain(GlyphInfo *head, bool dec_ref)
+{
+    GlyphInfo *node = head->next;
+    head->next = NULL;
+    while (node) {
+        GlyphInfo *next = node->next;
+        if (dec_ref) {
+            if (node->outline)
+                ass_cache_dec_ref(node->outline);
+            if (node->font)
+                ass_cache_dec_ref(node->font);
+        }
+        free(node);
+        node = next;
+    }
+}
+
+static void layout_snapshot_free_contents(LayoutSnapshot *snap)
+{
+    for (int i = 0; i < snap->length; i++) {
+        GlyphInfo *head = &snap->glyphs[i];
+        free_layout_chain(head, true);
+        if (head->outline)
+            ass_cache_dec_ref(head->outline);
+        if (head->font)
+            ass_cache_dec_ref(head->font);
+    }
+    free(snap->glyphs);
+    free(snap->lines);
+    free(snap->clip_drawing_text);
+    free(snap);
+}
+
+// Registry unlink; caller must hold layout_cache_mutex.
+static void layout_registry_unlink(ASS_Renderer *priv, LayoutSnapshot *snap)
+{
+    if (snap->reg_prev)
+        snap->reg_prev->reg_next = snap->reg_next;
+    else if (priv->layout_cache == snap)
+        priv->layout_cache = snap->reg_next;
+    if (snap->reg_next)
+        snap->reg_next->reg_prev = snap->reg_prev;
+    snap->reg_prev = snap->reg_next = NULL;
+}
+
+// Evict one snapshot: unlink from the registry, detach from its event, dec_ref
+// and free. dec_ref happens outside the lock.
+static void free_layout_snapshot(LayoutSnapshot *snap)
+{
+    if (!snap)
+        return;
+    ASS_Renderer *priv = snap->owner;
+    layout_cache_lock(priv);
+    layout_registry_unlink(priv, snap);
+    if (snap->back)
+        snap->back->layout = NULL;
+    layout_cache_unlock(priv);
+    layout_snapshot_free_contents(snap);
+}
+
+// Drop every live snapshot (on generation change and at renderer teardown).
+static void layout_cache_flush(ASS_Renderer *priv)
+{
+    layout_cache_lock(priv);
+    LayoutSnapshot *snap = priv->layout_cache;
+    priv->layout_cache = NULL;
+    for (LayoutSnapshot *s = snap; s; s = s->reg_next)
+        if (s->back)
+            s->back->layout = NULL;
+    layout_cache_unlock(priv);
+    while (snap) {
+        LayoutSnapshot *next = snap->reg_next;
+        snap->reg_prev = snap->reg_next = NULL;
+        layout_snapshot_free_contents(snap);
+        snap = next;
+    }
+}
+
+void ass_render_priv_done(RenderPriv *priv)
+{
+    if (!priv)
+        return;
+    if (priv->layout)
+        free_layout_snapshot(priv->layout);
+    free(priv);
+}
+
+// Memoized time-dependent-tag scan, keyed on the event's Text pointer (like
+// has_hard_overrides). Combined with the evt_type scroll check, this is the
+// layout-cache eligibility gate.
+static bool event_has_time_dependent_tags(RenderPriv *rp, ASS_Event *event)
+{
+    if (!rp)
+        return ass_event_has_time_dependent_tags(event->Text);
+    if (rp->time_dep_text != event->Text) {
+        rp->has_time_dep_tags = ass_event_has_time_dependent_tags(event->Text);
+        rp->time_dep_text = event->Text;
+    }
+    return rp->has_time_dep_tags;
+}
+
+// Build a snapshot of the fully laid-out event (called on a cacheable miss,
+// just before render_and_combine_glyphs). On any allocation failure the event
+// is simply not cached (the render proceeds normally).
+static void build_layout_snapshot(RenderContext *state, RenderPriv *rp,
+                                  double device_x, double device_y,
+                                  const ASS_DRect *bbox)
+{
+    ASS_Renderer *priv = state->renderer;
+    TextInfo *ti = &state->text_info;
+    int length = ti->length;
+
+    // A stale snapshot should have been evicted at lookup; drop any survivor.
+    if (rp->layout) {
+        free_layout_snapshot(rp->layout);
+        rp->layout = NULL;
+    }
+
+    LayoutSnapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap)
+        return;
+    snap->owner = priv;
+    snap->back = rp;
+    snap->gen = priv->layout_gen;
+
+    snap->glyphs = calloc(length, sizeof(GlyphInfo));
+    if (length && !snap->glyphs) {
+        free(snap);
+        return;
+    }
+    for (int i = 0; i < length; i++) {
+        GlyphInfo *head = &snap->glyphs[i];
+        copy_layout_glyph(head, &ti->glyphs[i], true);
+        GlyphInfo *src = ti->glyphs[i].next;
+        GlyphInfo **tail = &head->next;
+        while (src) {
+            GlyphInfo *node = malloc(sizeof(GlyphInfo));
+            if (!node)
+                goto fail;
+            copy_layout_glyph(node, src, true);
+            *tail = node;
+            tail = &node->next;
+            src = src->next;
+        }
+        snap->length = i + 1;
+    }
+
+    snap->n_lines = ti->n_lines;
+    if (ti->n_lines) {
+        snap->lines = malloc(ti->n_lines * sizeof(LineInfo));
+        if (!snap->lines)
+            goto fail;
+        memcpy(snap->lines, ti->lines, ti->n_lines * sizeof(LineInfo));
+    }
+    snap->height = ti->height;
+    snap->border_top = ti->border_top;
+    snap->border_bottom = ti->border_bottom;
+    snap->border_x = ti->border_x;
+
+    snap->blur_scale_x = state->blur_scale_x;
+    snap->blur_scale_y = state->blur_scale_y;
+    snap->border_scale_x = state->border_scale_x;
+    snap->border_scale_y = state->border_scale_y;
+    snap->screen_scale_x = state->screen_scale_x;
+    snap->screen_scale_y = state->screen_scale_y;
+    snap->border_style = state->border_style;
+    snap->back_color = state->c[3];
+    snap->fade = state->fade;
+    snap->shadow_x = state->shadow_x;
+    snap->shadow_y = state->shadow_y;
+    snap->clip_x0 = state->clip_x0;
+    snap->clip_y0 = state->clip_y0;
+    snap->clip_x1 = state->clip_x1;
+    snap->clip_y1 = state->clip_y1;
+    snap->clip_mode = state->clip_mode;
+    if (state->clip_drawing_text.str) {
+        snap->clip_drawing_text = ass_copy_string(state->clip_drawing_text);
+        if (!snap->clip_drawing_text)
+            goto fail;
+        snap->clip_drawing_len = state->clip_drawing_text.len;
+    }
+    snap->clip_drawing_scale = state->clip_drawing_scale;
+    snap->clip_drawing_mode = state->clip_drawing_mode;
+    snap->detect_collisions = state->detect_collisions;
+    snap->alignment = state->alignment;
+
+    snap->device_x = device_x;
+    snap->device_y = device_y;
+    snap->bbox = *bbox;
+
+    layout_cache_lock(priv);
+    snap->reg_prev = NULL;
+    snap->reg_next = priv->layout_cache;
+    if (priv->layout_cache)
+        priv->layout_cache->reg_prev = snap;
+    priv->layout_cache = snap;
+    layout_cache_unlock(priv);
+    rp->layout = snap;
+    return;
+
+fail:
+    // A chain malloc failed mid-head: clean the partially-built head (not yet
+    // counted in snap->length) before the generic free.
+    if (snap->glyphs && snap->length < length) {
+        GlyphInfo *head = &snap->glyphs[snap->length];
+        free_layout_chain(head, true);
+        if (head->outline)
+            ass_cache_dec_ref(head->outline);
+        if (head->font)
+            ass_cache_dec_ref(head->font);
+    }
+    layout_snapshot_free_contents(snap);
+}
+
+// Restore a snapshot into the live (thread-local) RenderContext, ready to skip
+// straight to render_and_combine_glyphs. Returns false on allocation failure,
+// leaving text_info empty so the caller can fall back to the full pipeline.
+static bool restore_layout_snapshot(RenderContext *state, const LayoutSnapshot *snap,
+                                    ASS_Event *event, double *device_x,
+                                    double *device_y, ASS_DRect *bbox)
+{
+    TextInfo *ti = &state->text_info;
+    int length = snap->length;
+
+    // The snapshot may have been built by another worker whose RenderContext
+    // grew larger; grow glyphs/event_text/breaks together to preserve the
+    // invariant the miss path relies on.
+    if (length > ti->max_glyphs) {
+        int new_max = length;
+        if (!ASS_REALLOC_ARRAY(ti->glyphs, new_max) ||
+                !ASS_REALLOC_ARRAY(ti->event_text, new_max) ||
+                !ASS_REALLOC_ARRAY(ti->breaks, new_max))
+            return false;
+        ti->max_glyphs = new_max;
+    }
+    if (snap->n_lines > ti->max_lines) {
+        int new_max = snap->n_lines;
+        if (!ASS_REALLOC_ARRAY(ti->lines, new_max))
+            return false;
+        ti->max_lines = new_max;
+    }
+
+    for (int i = 0; i < length; i++) {
+        copy_layout_glyph(&ti->glyphs[i], &snap->glyphs[i], false);
+        GlyphInfo *src = snap->glyphs[i].next;
+        GlyphInfo **tail = &ti->glyphs[i].next;
+        while (src) {
+            GlyphInfo *node = malloc(sizeof(GlyphInfo));
+            if (!node) {
+                for (int k = 0; k <= i; k++)
+                    free_layout_chain(&ti->glyphs[k], false);
+                ti->length = 0;
+                return false;
+            }
+            copy_layout_glyph(node, src, false);
+            *tail = node;
+            tail = &node->next;
+            src = src->next;
+        }
+    }
+    ti->length = length;
+    ti->n_lines = snap->n_lines;
+    if (snap->n_lines)
+        memcpy(ti->lines, snap->lines, snap->n_lines * sizeof(LineInfo));
+    ti->height = snap->height;
+    ti->border_top = snap->border_top;
+    ti->border_bottom = snap->border_bottom;
+    ti->border_x = snap->border_x;
+
+    state->event = event;
+    state->blur_scale_x = snap->blur_scale_x;
+    state->blur_scale_y = snap->blur_scale_y;
+    state->border_scale_x = snap->border_scale_x;
+    state->border_scale_y = snap->border_scale_y;
+    state->screen_scale_x = snap->screen_scale_x;
+    state->screen_scale_y = snap->screen_scale_y;
+    state->border_style = snap->border_style;
+    state->c[3] = snap->back_color;
+    state->fade = snap->fade;
+    state->shadow_x = snap->shadow_x;
+    state->shadow_y = snap->shadow_y;
+    state->clip_x0 = snap->clip_x0;
+    state->clip_y0 = snap->clip_y0;
+    state->clip_x1 = snap->clip_x1;
+    state->clip_y1 = snap->clip_y1;
+    state->clip_mode = snap->clip_mode;
+    state->clip_drawing_text.str = snap->clip_drawing_text;
+    state->clip_drawing_text.len = snap->clip_drawing_len;
+    state->clip_drawing_scale = snap->clip_drawing_scale;
+    state->clip_drawing_mode = snap->clip_drawing_mode;
+    state->detect_collisions = snap->detect_collisions;
+    state->alignment = snap->alignment;
+
+    *device_x = snap->device_x;
+    *device_y = snap->device_y;
+    *bbox = snap->bbox;
+    return true;
+}
+
 /**
  * \brief Main ass rendering function, glues everything together
  * \param event event to render
@@ -3121,6 +3489,39 @@ ass_render_event(RenderContext *state, EventImages *event_images)
         return false;
     }
 
+    TextInfo *text_info = &state->text_info;
+
+    // Shared geometry, produced by either the layout-cache restore (hit) or the
+    // full pipeline (miss) below, and consumed from the `render:` label onward.
+    int valign = 0;
+    double device_x = 0;
+    double device_y = 0;
+    ASS_DRect bbox;
+
+    // Layout cache (ASS_FEATURE_CACHE_LAYOUT): on a hit, restore the laid-out
+    // state for this static event and skip the whole parse/shape/layout pipeline.
+    bool cache_enabled = render_priv->track->parser_priv->feature_flags &
+                         FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT);
+    RenderPriv *rp = cache_enabled ? get_render_priv(render_priv, event) : NULL;
+    // A track can be shared by several renderers; the single per-event snapshot
+    // slot belongs to whichever renderer filled it. Only the owning renderer may
+    // use it — its outline/font refs live in that renderer's caches, so a foreign
+    // snapshot must be left untouched (this renderer just runs the full pipeline
+    // without caching while the other renderer is alive).
+    bool foreign_snapshot = rp && rp->layout && rp->layout->owner != render_priv;
+    if (rp && rp->layout && !foreign_snapshot) {
+        if (rp->layout->gen == render_priv->layout_gen &&
+                restore_layout_snapshot(state, rp->layout, event,
+                                        &device_x, &device_y, &bbox)) {
+            valign = state->alignment & 12;
+            goto render;
+        }
+        // Own snapshot but stale generation, or a restore that ran out of
+        // memory: drop it and fall back to the full pipeline.
+        free_layout_snapshot(rp->layout);
+    }
+
+    {   // --- full layout pipeline (cache miss) ---
     setup_shaper(state->shaper, render_priv);
 
     free_render_context(state);
@@ -3129,7 +3530,6 @@ ass_render_event(RenderContext *state, EventImages *event_images)
     if (!parse_events(state, event))
         return false;
 
-    TextInfo *text_info = &state->text_info;
     if (text_info->length == 0) {
         // no valid symbols in the event; this can be smth like {comment}
         free_render_context(state);
@@ -3153,7 +3553,7 @@ ass_render_event(RenderContext *state, EventImages *event_images)
 
     preliminary_layout(state);
 
-    int valign = state->alignment & 12;
+    valign = state->alignment & 12;
 
     int MarginL =
         (event->MarginL) ? event->MarginL : state->style->MarginL;
@@ -3178,14 +3578,13 @@ ass_render_event(RenderContext *state, EventImages *event_images)
     align_lines(state, max_text_width);
 
     // determine text bounding box
-    ASS_DRect bbox;
     compute_string_bbox(text_info, &bbox);
 
     apply_baseline_shear(state);
 
     // determine device coordinates for text
-    double device_x = 0;
-    double device_y = 0;
+    device_x = 0;
+    device_y = 0;
 
     // handle positioned events first: an event can be both positioned and
     // scrolling, and the scrolling effect overrides the position on one axis
@@ -3302,6 +3701,17 @@ ass_render_event(RenderContext *state, EventImages *event_images)
 
     calculate_rotation_params(state, &bbox, device_x, device_y);
 
+    // Cache this static event's laid-out state so later frames hit. Eligible =
+    // no scrolling/banner transition and no time-dependent override tags. Skip
+    // when another renderer owns the snapshot slot for this shared event.
+    if (cache_enabled && rp && !foreign_snapshot &&
+            !(state->evt_type & (EVENT_HSCROLL | EVENT_VSCROLL)) &&
+            !event_has_time_dependent_tags(rp, event)) {
+        build_layout_snapshot(state, rp, device_x, device_y, &bbox);
+    }
+    }   // --- end full layout pipeline (cache miss) ---
+
+render:
     render_and_combine_glyphs(state, device_x, device_y);
 
     // VSFilter does *not* shift lines with a border > margin to be within the
@@ -3466,6 +3876,41 @@ ass_start_frame(ASS_Renderer *render_priv, ASS_Track *track,
     render_priv->prev_images_root = render_priv->images_root;
     render_priv->images_root = NULL;
 
+    // Layout cache invalidation: bump layout_gen on any track-side layout input
+    // that has no setter funnel (renderer-config setters bump it directly). This
+    // is the single per-frame funnel for track edits, embedded-font reload and
+    // per-track feature toggles. Whenever the gen advances (here or via a
+    // setter), flush the snapshot registry so stale entries stop pinning cache
+    // entries.
+    if (!render_priv->layout_seen.valid ||
+        render_priv->layout_seen.track != track ||
+        render_priv->layout_seen.play_res_x != track->PlayResX ||
+        render_priv->layout_seen.play_res_y != track->PlayResY ||
+        render_priv->layout_seen.layout_res_x != track->LayoutResX ||
+        render_priv->layout_seen.layout_res_y != track->LayoutResY ||
+        render_priv->layout_seen.wrap_style != track->WrapStyle ||
+        render_priv->layout_seen.kerning != track->Kerning ||
+        render_priv->layout_seen.scaled_border_and_shadow != track->ScaledBorderAndShadow ||
+        render_priv->layout_seen.feature_flags != track->parser_priv->feature_flags ||
+        render_priv->layout_seen.num_emfonts != render_priv->num_emfonts) {
+        render_priv->layout_gen++;
+        render_priv->layout_seen.valid = true;
+        render_priv->layout_seen.track = track;
+        render_priv->layout_seen.play_res_x = track->PlayResX;
+        render_priv->layout_seen.play_res_y = track->PlayResY;
+        render_priv->layout_seen.layout_res_x = track->LayoutResX;
+        render_priv->layout_seen.layout_res_y = track->LayoutResY;
+        render_priv->layout_seen.wrap_style = track->WrapStyle;
+        render_priv->layout_seen.kerning = track->Kerning;
+        render_priv->layout_seen.scaled_border_and_shadow = track->ScaledBorderAndShadow;
+        render_priv->layout_seen.feature_flags = track->parser_priv->feature_flags;
+        render_priv->layout_seen.num_emfonts = render_priv->num_emfonts;
+    }
+    if (render_priv->layout_gen != render_priv->layout_gen_flushed) {
+        layout_cache_flush(render_priv);
+        render_priv->layout_gen_flushed = render_priv->layout_gen;
+    }
+
     ass_cache_promote(&render_priv->cache.client_set);
     check_cache_limits(render_priv, &render_priv->cache);
 
@@ -3540,6 +3985,11 @@ static ASS_RenderPriv *get_render_priv(ASS_Renderer *render_priv,
             return NULL;
     }
     if (render_priv->render_id != event->render_priv->render_id) {
+        // The layout cache is normally flushed in ass_start_frame before any
+        // event is rendered, so ->layout is already NULL here; free defensively
+        // to avoid orphaning a snapshot if it somehow survives.
+        if (event->render_priv->layout)
+            free_layout_snapshot(event->render_priv->layout);
         memset(event->render_priv, 0, sizeof(ASS_RenderPriv));
         event->render_priv->render_id = render_priv->render_id;
     }

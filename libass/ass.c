@@ -140,6 +140,9 @@ int ass_alloc_event(ASS_Track *track)
     return eid;
 }
 
+// defined in ass_render.c; frees any cached layout snapshot before the struct
+void ass_render_priv_done(ASS_RenderPriv *priv);
+
 void ass_free_event(ASS_Track *track, int eid)
 {
     ASS_Event *event = track->events + eid;
@@ -147,7 +150,7 @@ void ass_free_event(ASS_Track *track, int eid)
     free(event->Name);
     free(event->Effect);
     free(event->Text);
-    free(event->render_priv);
+    ass_render_priv_done(event->render_priv);
 }
 
 void ass_free_style(ASS_Track *track, int sid)
@@ -1828,6 +1831,11 @@ int ass_track_set_feature(ASS_Track *track, ASS_Feature feature, int enable)
         // A performance/quality knob, opted into on its own rather than
         // bundled with the incompatible-extensions umbrella above.
         requested = FEATURE_MASK(ASS_FEATURE_MOTION_CACHE);
+        break;
+    case ASS_FEATURE_CACHE_LAYOUT:
+        // A performance knob, opted into on its own rather than bundled with
+        // the incompatible-extensions umbrella above.
+        requested = FEATURE_MASK(ASS_FEATURE_CACHE_LAYOUT);
         break;
     default:
         if (!(FEATURE_MASK(feature) & supported))

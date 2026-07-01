@@ -1290,3 +1290,38 @@ int ass_event_has_hard_overrides(char *str)
     }
     return 0;
 }
+
+int ass_event_has_time_dependent_tags(char *str)
+{
+    // look for time-dependent override tags inside {...}: \t, \move,
+    // \fad/\fade and karaoke (\k, \K, \kf, \ko). Mirrors
+    // ass_event_has_hard_overrides. An event with any of these (or a
+    // scrolling/banner transition effect, handled separately) cannot be served
+    // from a single static layout snapshot. Over-detection is safe (it only
+    // disables the layout cache); a missed tag would silently produce wrong
+    // output, so the token set deliberately errs broad ("k" also covers \kf/\ko).
+    while (*str) {
+        if (str[0] == '\\' && str[1] != '\0') {
+            str += 2;
+        } else if (str[0] == '{') {
+            str++;
+            while (*str && *str != '}') {
+                if (*str == '\\') {
+                    // ass_parse_tags skips spaces/tabs after the backslash
+                    // before the tag name, so "\ t(...)" is a live \t; mirror
+                    // that here or such forms would be wrongly cached.
+                    char *p = str + 1;
+                    skip_spaces(&p);
+                    if (mystrcmp(&p, "move") || mystrcmp(&p, "fad") ||
+                        mystrcmp(&p, "t") || mystrcmp(&p, "k") ||
+                        mystrcmp(&p, "K"))
+                        return 1;
+                }
+                str++;
+            }
+        } else {
+            str++;
+        }
+    }
+    return 0;
+}

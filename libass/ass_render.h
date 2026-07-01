@@ -337,6 +337,53 @@ typedef struct {
     size_t composite_max_size;
 } CacheStore;
 
+// One fully laid-out static event, cached across frames when
+// ASS_FEATURE_CACHE_LAYOUT is enabled. Built once (on a layout-cache miss for an
+// eligible event) right before render_and_combine_glyphs, restored on later
+// frames to skip the whole parse/shape/layout pipeline. Owns deep copies of the
+// laid-out glyphs (including cluster next-chains) and holds an inc_ref on each
+// glyph's outline/font so they survive LRU eviction while the snapshot lives.
+// Snapshots are owned by a per-renderer intrusive registry (reg_next/reg_prev)
+// so the renderer can dec_ref/free them while its caches are still alive,
+// regardless of renderer-vs-track teardown order.
+typedef struct layout_snapshot {
+    uint32_t gen;               // renderer layout_gen this was built under
+
+    // deep-copied laid-out text_info payload
+    GlyphInfo *glyphs;          // owned cluster-head array (length entries)
+    int length;
+    LineInfo *lines;            // owned (n_lines entries)
+    int n_lines;
+    double height;
+    int border_top, border_bottom, border_x;
+
+    // RenderContext scalars read at/after the cache boundary
+    double blur_scale_x, blur_scale_y;
+    double border_scale_x, border_scale_y;
+    double screen_scale_x, screen_scale_y;
+    int border_style;
+    uint32_t back_color;        // state->c[3]
+    int fade;
+    double shadow_x, shadow_y;
+    int clip_x0, clip_y0, clip_x1, clip_y1;   // screen-space (post-transform)
+    char clip_mode;
+    char *clip_drawing_text;    // owned copy, or NULL
+    size_t clip_drawing_len;
+    int clip_drawing_scale;
+    int clip_drawing_mode;
+    char detect_collisions;
+    int alignment;
+
+    // local geometry consumed at/after the boundary
+    double device_x, device_y;
+    ASS_DRect bbox;
+
+    // registry bookkeeping
+    struct layout_snapshot *reg_next, *reg_prev;
+    struct ass_renderer *owner; // for registry-aware free from ass_free_event
+    struct render_priv *back;   // event->render_priv, to null ->layout on flush
+} LayoutSnapshot;
+
 struct ass_renderer {
     ASS_Library *library;
     FT_Library ftlibrary;
@@ -344,6 +391,32 @@ struct ass_renderer {
     size_t num_emfonts;
     ASS_Settings settings;
     int render_id;
+
+    // Layout cache (ASS_FEATURE_CACHE_LAYOUT). layout_gen is bumped on any
+    // layout-affecting change; snapshots store the gen they were built under and
+    // are invalidated on mismatch. layout_cache is the head of an intrusive
+    // registry of all live snapshots (so they can be freed/dec_ref'd while the
+    // caches are alive). layout_seen caches the track-side layout inputs that
+    // have no setter funnel, so ass_start_frame can bump layout_gen when they
+    // change.
+    uint32_t layout_gen;
+    uint32_t layout_gen_flushed;        // last gen the registry was flushed at
+    LayoutSnapshot *layout_cache;
+#if ENABLE_THREADS
+    pthread_mutex_t layout_cache_mutex;
+    int layout_cache_mutex_inited;
+#endif
+    struct {
+        bool valid;
+        ASS_Track *track;
+        int play_res_x, play_res_y;
+        int layout_res_x, layout_res_y;
+        int wrap_style;
+        int kerning;
+        int scaled_border_and_shadow;
+        uint32_t feature_flags;
+        size_t num_emfonts;
+    } layout_seen;
 
     ASS_Image *images_root;     // rendering result is stored here
     ASS_Image *prev_images_root;
@@ -390,6 +463,11 @@ typedef struct render_priv {
     int render_id;
     char *hard_overrides_text;
     bool has_hard_overrides;
+    // ASS_FEATURE_CACHE_LAYOUT: memoized time-dependent-tag scan (keyed on the
+    // event's Text pointer, like hard_overrides) and the cached layout snapshot.
+    char *time_dep_text;
+    bool has_time_dep_tags;
+    LayoutSnapshot *layout;
 } RenderPriv;
 
 typedef struct {
@@ -406,5 +484,9 @@ ASS_Vector ass_layout_res(ASS_Renderer *render_priv);
 
 // XXX: this is actually in ass.c, includes should be fixed later on
 void ass_lazy_track_init(ASS_Library *lib, ASS_Track *track);
+
+// Release a per-event RenderPriv (frees any attached layout snapshot first).
+// Called from ass_free_event in ass.c.
+void ass_render_priv_done(RenderPriv *priv);
 
 #endif /* LIBASS_RENDER_H */
