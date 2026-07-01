@@ -3366,7 +3366,21 @@ static void *run_thread(void *ptr)
         pthread_mutex_unlock(&priv->mutex);
 
         uintptr_t got_eimg;
+        bool cascaded = false;
         while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1, memory_order_relaxed)) < atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+            // Cascade: wake one sibling the first time we confirm there is more
+            // work, so the pool ramps up to the real parallelism (at most one
+            // signal per worker -> at most n_threads signals/frame, never per
+            // event). Done before rendering so the sibling wakes during this
+            // render. Frames the main thread can handle alone never reach here
+            // (no slot grabbed -> no cascade), so they don't wake the pool.
+            if (!cascaded && got_eimg + 1 < atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+                cascaded = true;
+                pthread_mutex_lock(&priv->mutex);
+                pthread_cond_signal(&priv->pool_cond);
+                pthread_mutex_unlock(&priv->mutex);
+            }
+
             EventImages *imgs = priv->eimg + got_eimg;
 
             ass_render_event(&state, imgs);
@@ -3890,12 +3904,45 @@ ASS_Image *ass_render_frame(ASS_Renderer *priv, ASS_Track *track,
         atomic_store_explicit(&priv->sent_eimgs, cnt, memory_order_release);
         atomic_store_explicit(&priv->next_eimg, 0, memory_order_release);
 
-        pthread_cond_broadcast(&priv->pool_cond);
+        // Wake ONE worker (not all of them). Workers cascade: each one that
+        // actually grabs an event wakes one more, but only while work remains,
+        // so the number of woken workers tracks the real parallelism. A frame
+        // the main thread can handle alone (warm/light) thus wakes ~1 worker
+        // instead of the whole pool -- no thundering herd -- while heavy frames
+        // still ramp up to full parallelism (the wake overlaps the first render).
+        pthread_cond_signal(&priv->pool_cond);
 
-        while (atomic_load_explicit(&priv->processing_eimgs, memory_order_acquire))
-            pthread_cond_wait(&priv->main_cond, &priv->mutex);
-
+        // Release the lock so workers can start stealing immediately, and let
+        // the main thread steal events from the same atomic queue instead of
+        // blocking idle until they finish. This makes the threaded path never
+        // slower than serial (the main thread does at least as much work as it
+        // would serially) and adds one more renderer for large event sets.
+        // Output is independent of which thread renders which event.
         pthread_mutex_unlock(&priv->mutex);
+
+        bool main_done_all = false;
+        uintptr_t got_eimg;
+        while ((got_eimg = atomic_fetch_add_explicit(&priv->next_eimg, 1,
+                        memory_order_relaxed)) <
+                atomic_load_explicit(&priv->sent_eimgs, memory_order_relaxed)) {
+            ass_render_event(&priv->state, priv->eimg + got_eimg);
+
+            if (atomic_fetch_sub_explicit(&priv->processing_eimgs, 1,
+                        memory_order_acq_rel) - 1 == 0) {
+                main_done_all = true;  // main rendered the last event
+                break;
+            }
+        }
+
+        // Main exhausted the queue; wait for workers to finish any remaining
+        // events. (Re-checks the predicate under the lock, so a worker signal
+        // that races ahead of this lock is not lost.)
+        if (!main_done_all) {
+            pthread_mutex_lock(&priv->mutex);
+            while (atomic_load_explicit(&priv->processing_eimgs, memory_order_acquire))
+                pthread_cond_wait(&priv->main_cond, &priv->mutex);
+            pthread_mutex_unlock(&priv->mutex);
+        }
     } else
 #endif
     {
