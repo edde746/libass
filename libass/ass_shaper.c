@@ -981,6 +981,33 @@ void ass_shaper_set_whole_text_layout(ASS_Shaper *shaper, bool enable)
 }
 
 /**
+ * \brief Bidi types that resolve to embedding level 0 under an LTR base
+ * direction, provided the whole paragraph contains only such types.
+ *
+ * If a paragraph consists solely of these types (i.e. it contains no R/AL/AN
+ * and no explicit-override or isolate formatting characters), then under an
+ * LTR-resolving base direction every character resolves to embedding level 0
+ * by the Unicode Bidirectional Algorithm:
+ *   - L and CJK/etc. strong-left are level 0 directly;
+ *   - EN is retyped to L by W7 (the backward search hits sor=L or an L, never
+ *     an R, since none exist), so it never reaches I1's +2;
+ *   - ES/ET/CS/ON/NSM resolve as weak/neutral to the base direction (level 0);
+ *   - WS/BS/SS are reset to the paragraph level (0) by L1; BN is removed.
+ * Any excluded type (R, AL, AN, LRE/RLE/LRO/RLO/PDF, LRI/RLI/FSI/PDI) can raise
+ * the level and forces the slow path. This is verified bit-exact against
+ * fribidi_get_par_embedding_levels_ex by a differential fuzzer.
+ */
+static inline bool bidi_type_ltr_level0(FriBidiCharType t)
+{
+    return t == FRIBIDI_TYPE_LTR || t == FRIBIDI_TYPE_EN ||
+           t == FRIBIDI_TYPE_ES  || t == FRIBIDI_TYPE_ET ||
+           t == FRIBIDI_TYPE_CS  || t == FRIBIDI_TYPE_NSM ||
+           t == FRIBIDI_TYPE_BN  || t == FRIBIDI_TYPE_BS  ||
+           t == FRIBIDI_TYPE_SS  || t == FRIBIDI_TYPE_WS  ||
+           t == FRIBIDI_TYPE_ON;
+}
+
+/**
  * \brief Shape an event's text. Calculates directional runs and shapes them.
  * \param text_info event's text
  * \return success, when 0
@@ -1001,16 +1028,28 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
     fribidi_get_bidi_types(shaper->event_text,
             text_info->length, shaper->ctypes);
 
+    // A paragraph whose every character resolves to embedding level 0 under an
+    // LTR base can skip the (malloc-heavy) fribidi bidi resolution entirely.
+    // This covers the overwhelmingly common Latin/CJK/Cyrillic/... subtitle
+    // text. Only the LTR-resolving base directions libass uses qualify; any
+    // disqualifying character drops the whole event onto the fribidi slow path.
+    bool simple_ltr = shaper->base_direction == FRIBIDI_PAR_LTR ||
+                      shaper->base_direction == FRIBIDI_PAR_ON;
+
     int n_pars = 1;
-    for (i = 0; i < text_info->length - 1; i++)
-        if (shaper->ctypes[i] == FRIBIDI_TYPE_BS)
+    for (i = 0; i < text_info->length; i++) {
+        FriBidiCharType t = shaper->ctypes[i];
+        if (i < text_info->length - 1 && t == FRIBIDI_TYPE_BS)
             n_pars++;
+        if (!bidi_type_ltr_level0(t))
+            simple_ltr = false;
+    }
 
     if (!check_par_allocations(shaper, n_pars))
         return false;
 
 #ifdef USE_FRIBIDI_EX_API
-    if (shaper->bidi_brackets) {
+    if (shaper->bidi_brackets && !simple_ltr) {
         fribidi_get_bracket_types(shaper->event_text,
                 text_info->length, shaper->ctypes, shaper->btypes);
     }
@@ -1026,19 +1065,36 @@ bool ass_shaper_shape(ASS_Shaper *shaper, TextInfo *text_info)
                 (!shaper->whole_text_layout &&
                     (glyphs[i + 1].starts_new_run || glyphs[i].hspacing))) {
             dir = shaper->base_direction;
+            if (simple_ltr) {
+                // All embedding levels are 0. The resolved paragraph direction
+                // matches fribidi's: a strong-LTR base stays LTR; an auto (ON)
+                // base becomes LTR iff the paragraph has a strong-L character,
+                // otherwise fribidi leaves it as ON (no strong char to resolve).
+                memset(shaper->emblevels + last_break, 0,
+                       (i - last_break + 1) * sizeof(*shaper->emblevels));
+                if (dir == FRIBIDI_PAR_ON) {
+                    for (int j = last_break; j <= i; j++) {
+                        if (shaper->ctypes[j] == FRIBIDI_TYPE_LTR) {
+                            dir = FRIBIDI_PAR_LTR;
+                            break;
+                        }
+                    }
+                }
+            } else {
 #ifdef USE_FRIBIDI_EX_API
-            FriBidiBracketType *btypes = NULL;
-            if (shaper->bidi_brackets)
-                btypes = shaper->btypes + last_break;
-            ret = fribidi_get_par_embedding_levels_ex(
-                    shaper->ctypes + last_break, btypes,
-                    i - last_break + 1, &dir, shaper->emblevels + last_break);
+                FriBidiBracketType *btypes = NULL;
+                if (shaper->bidi_brackets)
+                    btypes = shaper->btypes + last_break;
+                ret = fribidi_get_par_embedding_levels_ex(
+                        shaper->ctypes + last_break, btypes,
+                        i - last_break + 1, &dir, shaper->emblevels + last_break);
 #else
-            ret = fribidi_get_par_embedding_levels(shaper->ctypes + last_break,
-                    i - last_break + 1, &dir, shaper->emblevels + last_break);
+                ret = fribidi_get_par_embedding_levels(shaper->ctypes + last_break,
+                        i - last_break + 1, &dir, shaper->emblevels + last_break);
 #endif
-            if (ret == 0)
-                return false;
+                if (ret == 0)
+                    return false;
+            }
             last_break = i + 1;
             if (shaper->whole_text_layout)
                 *pdir++ = dir;
